@@ -1,0 +1,142 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<sdf version="1.9">
+  <world name="sample_15016">
+    <physics type="ode">
+      <max_step_size>0.004</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+      <real_time_update_rate>250</real_time_update_rate>
+    </physics>
+    <gravity>0 0 -9.8</gravity>
+    <magnetic_field>6e-06 2.3e-05 -4.2e-05</magnetic_field>
+    <atmosphere type="adiabatic"/>
+    <scene>
+      <grid>false</grid>
+      <ambient>0.4 0.4 0.4 1</ambient>
+      <background>0.7 0.7 0.7 1</background>
+      <shadows>true</shadows>
+    </scene>
+    <model name="lunar_ground">
+      <static>true</static>
+      <pose>0 0 0 0 0 0</pose>
+      <link name="ground_link">
+        <collision name="ground_collision">
+          <geometry>
+            <box><size>200 200 0.1</size></box>
+          </geometry>
+        </collision>
+        <visual name="ground_visual">
+          <geometry>
+            <plane><normal>0 0 1</normal><size>200 200</size></plane>
+          </geometry>
+          <material>
+            <ambient>0.4 0.4 0.4 1</ambient>
+            <diffuse>0.6 0.55 0.5 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+            <pbr>
+              <metal>
+                <albedo_map>file:///home/blazair/workspaces/gs_ws/models/moon_surface/textures/Diffuse.jpeg</albedo_map>
+                <normal_map>file:///home/blazair/workspaces/gs_ws/models/moon_surface/textures/NormalMap.jpeg</normal_map>
+                <roughness_map>file:///home/blazair/workspaces/gs_ws/models/moon_surface/textures/Roughness.jpeg</roughness_map>
+              </metal>
+            </pbr>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Scattered rocks for visual features -->
+    <include>
+      <uri>model://rock</uri>
+      <name>rock_a</name>
+      <pose>15 -10 0 0 0 0.3</pose>
+      <static>true</static>
+    </include>
+    <include>
+      <uri>model://rock</uri>
+      <name>rock_b</name>
+      <pose>-12 -8 0 0 0 1.2</pose>
+      <static>true</static>
+    </include>
+    <include>
+      <uri>model://rock</uri>
+      <name>rock_c</name>
+      <pose>5 12 0 0 0 2.5</pose>
+      <static>true</static>
+    </include>
+    <include>
+      <uri>model://rock</uri>
+      <name>rock_d</name>
+      <pose>-18 5 0 0 0 4.0</pose>
+      <static>true</static>
+    </include>
+    <light name="sunUTC" type="directional">
+      <pose>0 0 500 0 -0 0</pose>
+      <cast_shadows>true</cast_shadows>
+      <intensity>1</intensity>
+      <direction>0.001 0.625 -0.78</direction>
+      <diffuse>0.904 0.904 0.904 1</diffuse>
+      <specular>0.271 0.271 0.271 1</specular>
+      <attenuation>
+        <range>2000</range>
+        <linear>0</linear>
+        <constant>1</constant>
+        <quadratic>0</quadratic>
+      </attenuation>
+      <spot>
+        <inner_angle>0</inner_angle>
+        <outer_angle>0</outer_angle>
+        <falloff>0</falloff>
+      </spot>
+    </light>
+    <spherical_coordinates>
+      <surface_model>EARTH_WGS84</surface_model>
+      <world_frame_orientation>ENU</world_frame_orientation>
+      <latitude_deg>47.397971057728974</latitude_deg>
+      <longitude_deg> 8.546163739800146</longitude_deg>
+      <elevation>0</elevation>
+    </spherical_coordinates>
+
+    <!-- Apollo lunar sample 15016 at 3m in front of drone spawn -->
+    <model name="lunar_sample_15016">
+      <pose>8 0 0.8 0 0 0</pose>
+      <static>true</static>
+      <link name='body'>
+        <visual name='visual'>
+          <geometry>
+            <mesh>
+              <uri>model://lunar_sample_15016/meshes/15016-0_SFM_Web-Resolution-Model_Coordinate-Registered.obj</uri>
+              <scale>20 20 20</scale>
+            </mesh>
+          </geometry>
+        </visual>
+        <collision name='collision'>
+          <geometry>
+            <box><size>1.2 1.4 1.6</size></box>
+          </geometry>
+        </collision>
+      </link>
+    </model>
+
+    <!-- Second rock behind drone spawn -->
+    <model name="lunar_sample_65035">
+      <pose>-7 2 0.5 0 1.5708 -0.278</pose>
+      <static>true</static>
+      <link name='body'>
+        <visual name='visual'>
+          <geometry>
+            <mesh>
+              <uri>model://lunar_sample_65035/meshes/65035-0_SFM_Web-Resolution-Model_Coordinate-Registered.obj</uri>
+              <scale>20 20 20</scale>
+            </mesh>
+          </geometry>
+        </visual>
+        <collision name='collision'>
+          <geometry>
+            <box><size>0.9 1.2 1.6</size></box>
+          </geometry>
+        </collision>
+      </link>
+    </model>
+
+  </world>
+</sdf>

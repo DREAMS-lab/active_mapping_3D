@@ -1,0 +1,41 @@
+#!/bin/sh
+#
+# @name Gazebo px4_gsplat
+#
+# @type Quadrotor
+#
+
+PX4_SIM_MODEL=${PX4_SIM_MODEL:=px4_gsplat}
+
+. ${R}etc/init.d-posix/airframes/4001_gz_x500
+
+# Gimbal settings
+param set-default MNT_MODE_IN 4
+param set-default MNT_MODE_OUT 0
+param set-default MNT_RC_IN_MODE 1
+
+param set-default MNT_MAN_ROLL 1
+param set-default MNT_MAN_PITCH 2
+param set-default MNT_MAN_YAW 3
+
+param set-default MNT_RANGE_ROLL 180
+param set-default MNT_MAX_PITCH 45
+param set-default MNT_MIN_PITCH -135
+param set-default MNT_RANGE_YAW 720
+
+# Offboard failsafe: exempt from RC loss, hold on offboard loss
+param set-default COM_RCL_EXCEPT 4
+param set-default COM_OBL_RC_ACT 0
+
+# Disable data link (GCS) loss failsafe — no QGroundControl needed
+param set-default NAV_DLL_ACT 0
+
+# Offboard loss timeout — generous for Python GIL pauses during CUDA/imports
+# Use 'param set' because rcS sets COM_OF_LOSS_T before airframe scripts
+param set COM_OF_LOSS_T 5.0
+
+# Battery: slow drain, no failsafe action (SITL missions run 2+ minutes)
+# Use 'param set' because rcS sets COM_LOW_BAT_ACT=3 before airframe scripts
+param set SIM_BAT_DRAIN 600
+param set SIM_BAT_MIN_PCT 0.0
+param set COM_LOW_BAT_ACT 0
