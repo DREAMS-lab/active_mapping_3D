@@ -1,0 +1,9 @@
+build/
+install/
+log/
+data/
+*.tar.gz
+__pycache__/
+*.pyc
+.vscode/
+CLAUDE.md

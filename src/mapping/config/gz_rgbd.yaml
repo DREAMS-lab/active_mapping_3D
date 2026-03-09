@@ -1,0 +1,68 @@
+%YAML:1.0
+
+#--------------------------------------------------------------------------------------------
+# Gazebo RGBD Camera Configuration for ORB-SLAM3
+# Model: gimbal_rgbd (co-located RGB + depth_camera sensors)
+# Resolution: 1920x1080, HFOV: 1.204 rad
+# Depth range: 0.2m - 20.0m
+#--------------------------------------------------------------------------------------------
+File.version: "1.0"
+
+Camera.type: "PinHole"
+
+# Intrinsics derived from HFOV=1.204 rad, 1920x1080
+# fx = fy = 1920 / (2 * tan(1.204/2)) = 1397.2235
+Camera1.fx: 465.7412
+Camera1.fy: 465.7412
+Camera1.cx: 320.0
+Camera1.cy: 240.0
+
+# No distortion (simulated pinhole camera)
+Camera1.k1: 0.0
+Camera1.k2: 0.0
+Camera1.p1: 0.0
+Camera1.p2: 0.0
+
+# Camera resolution
+Camera.width: 640
+Camera.height: 480
+
+# Camera frames per second
+Camera.fps: 30
+
+# Color order (0: BGR, 1: RGB). Gazebo publishes R8G8B8.
+Camera.RGB: 1
+
+# Stereo baseline (m). Required even for RGBD — used with ThDepth for far point cutoff.
+# Virtual baseline for RGBD: bf = Stereo.b * fx. With b=0.05, bf=23.3, far cutoff = 23.3*7/fx ~ 0.35m...
+# For RGBD the far threshold is ThDepth * bf / fx = ThDepth * b.
+# b=0.05m, ThDepth=40 -> far = 2.0m is too short. Use larger values.
+Stereo.b: 0.05
+Stereo.ThDepth: 999.0
+
+# Depth map factor. Gazebo depth_camera publishes float32 in metres.
+# DepthMapFactor = 1.0 means depth values are already in metres.
+RGBD.DepthMapFactor: 1.0
+
+#--------------------------------------------------------------------------------------------
+# ORB Parameters
+#--------------------------------------------------------------------------------------------
+ORBextractor.nFeatures: 2000
+ORBextractor.scaleFactor: 1.2
+ORBextractor.nLevels: 8
+ORBextractor.iniThFAST: 10
+ORBextractor.minThFAST: 5
+
+#--------------------------------------------------------------------------------------------
+# Viewer Parameters (Pangolin)
+#--------------------------------------------------------------------------------------------
+Viewer.KeyFrameSize: 0.05
+Viewer.KeyFrameLineWidth: 1.0
+Viewer.GraphLineWidth: 0.9
+Viewer.PointSize: 2.0
+Viewer.CameraSize: 0.08
+Viewer.CameraLineWidth: 3.0
+Viewer.ViewpointX: 0.0
+Viewer.ViewpointY: -0.7
+Viewer.ViewpointZ: -3.5
+Viewer.ViewpointF: 500.0

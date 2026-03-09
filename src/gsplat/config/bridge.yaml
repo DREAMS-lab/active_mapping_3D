@@ -1,0 +1,46 @@
+# --- Camera sensors (GZ -> ROS) ---
+- ros_topic_name: /rgbd/image
+  gz_topic_name: /rgbd/image
+  ros_type_name: sensor_msgs/msg/Image
+  gz_type_name: gz.msgs.Image
+  direction: GZ_TO_ROS
+
+- ros_topic_name: /rgbd/depth
+  gz_topic_name: /rgbd/depth
+  ros_type_name: sensor_msgs/msg/Image
+  gz_type_name: gz.msgs.Image
+  direction: GZ_TO_ROS
+
+- ros_topic_name: /rgbd/camera_info
+  gz_topic_name: /rgbd/image/camera_info
+  ros_type_name: sensor_msgs/msg/CameraInfo
+  gz_type_name: gz.msgs.CameraInfo
+  direction: GZ_TO_ROS
+
+- ros_topic_name: /rgbd/points
+  gz_topic_name: /rgbd/depth/points
+  ros_type_name: sensor_msgs/msg/PointCloud2
+  gz_type_name: gz.msgs.PointCloudPacked
+  direction: GZ_TO_ROS
+
+# NOTE: Camera IMU topic is world-name-dependent and bridged separately if needed:
+#   gz_topic: /world/<WORLD>/model/px4_gsplat_0/link/camera_link/sensor/camera_imu/imu
+
+# --- Gimbal commands (ROS -> GZ) ---
+- ros_topic_name: /gimbal/pitch
+  gz_topic_name: /model/px4_gsplat_0/command/manual_gimbal_pitch
+  ros_type_name: std_msgs/msg/Float64
+  gz_type_name: gz.msgs.Double
+  direction: ROS_TO_GZ
+
+- ros_topic_name: /gimbal/roll
+  gz_topic_name: /model/px4_gsplat_0/command/manual_gimbal_roll
+  ros_type_name: std_msgs/msg/Float64
+  gz_type_name: gz.msgs.Double
+  direction: ROS_TO_GZ
+
+- ros_topic_name: /gimbal/yaw
+  gz_topic_name: /model/px4_gsplat_0/command/manual_gimbal_yaw
+  ros_type_name: std_msgs/msg/Float64
+  gz_type_name: gz.msgs.Double
+  direction: ROS_TO_GZ
