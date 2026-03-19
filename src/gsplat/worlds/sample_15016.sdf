@@ -34,9 +34,9 @@
             <specular>0.1 0.1 0.1 1</specular>
             <pbr>
               <metal>
-                <albedo_map>file:///home/blazair/workspaces/gs_ws/models/moon_surface/textures/Diffuse.jpeg</albedo_map>
-                <normal_map>file:///home/blazair/workspaces/gs_ws/models/moon_surface/textures/NormalMap.jpeg</normal_map>
-                <roughness_map>file:///home/blazair/workspaces/gs_ws/models/moon_surface/textures/Roughness.jpeg</roughness_map>
+                <albedo_map>file://__REPO_ROOT__/simulation/textures/moon_surface/textures/Diffuse.jpeg</albedo_map>
+                <normal_map>file://__REPO_ROOT__/simulation/textures/moon_surface/textures/NormalMap.jpeg</normal_map>
+                <roughness_map>file://__REPO_ROOT__/simulation/textures/moon_surface/textures/Roughness.jpeg</roughness_map>
               </metal>
             </pbr>
           </material>

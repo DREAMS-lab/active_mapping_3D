@@ -1,0 +1,5 @@
+torch>=2.6
+gsplat==1.5.3
+opencv-python
+matplotlib
+numpy<2

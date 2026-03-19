@@ -11,8 +11,11 @@ if [ -z "$1" ]; then
 fi
 
 RUN_NUM=$(printf "%03d" "$1")
-WS="$HOME/workspaces/gs_ws"
-RUN="$WS/data/mapping/run_${RUN_NUM}"
+# Derive workspace root from script location:
+# <ws>/install/mapping/share/mapping/scripts/reconstruction/colmap.sh -> <ws>
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+WS_ROOT="$(cd "$SCRIPT_DIR/../../../../../.." && pwd)"
+RUN="$WS_ROOT/data/mapping/run_${RUN_NUM}"
 
 if [ ! -d "$RUN/images" ]; then
     echo "Error: $RUN/images not found"

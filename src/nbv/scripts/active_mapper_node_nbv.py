@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Active mapper: orbit flight + live 3DGS training + splat viewer + voxel coverage.
+"""NBV mapper: Gaussian uncertainty + angular information viewpoint selection.
 
 Single-process, three-thread architecture:
   Thread 1 (ROS main): Flight FSM, keyframe selection, PX4 offboard control,
@@ -8,12 +8,17 @@ Single-process, three-thread architecture:
   Thread 3 (Viewer): OpenCV splat viewer with mouse orbit controls
 
 Flight state machine:
-  PREFLIGHT -> TAKEOFF -> INITIAL_ORBIT -> SECOND_ORBIT -> RETURN -> LANDING -> DONE
+  PREFLIGHT -> TAKEOFF -> SEED (4 KFs at 90° intervals)
+            -> [NBV_SCORE -> NBV_FLY -> NBV_SETTLE] x N rounds (4 KFs each)
+            -> RETURN -> LANDING -> OFFLINE_RECON -> DONE
 
-Uses PX4 ground-truth poses (no COLMAP needed during flight).
-After landing: saves data + evaluation outputs.
-
-Logs detailed compute metrics: GPU, VRAM, timing, loss components, battery, coverage.
+Fully adaptive approach:
+  1. Seed: 4 images from quarter-orbit (90° apart) build initial 3DGS model
+  2. Score-fly loop: every 4 captures, re-score all candidates using
+     Gaussian uncertainty (gradient, anisotropy, opacity, scale) combined
+     with angular information, pick next 4 best viewpoints, fly + capture
+  3. Each round's decisions are based on everything seen so far
+  4. Offline reconstruction via gaussian-splatting at full 1080p (30K iters)
 """
 
 import json
@@ -48,10 +53,10 @@ from cv_bridge import CvBridge
 # Local imports (same directory)
 script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, script_dir)
-from gaussian_model import GaussianModel3DGS, FX, FY, CX, CY, W, H
-from splat_viewer import SplatViewer
-from voxel_grid import VoxelGrid
-from rviz_publisher import RVizPublisher
+from gaussian_model_nbv import GaussianModel3DGS, FX, FY, CX, CY, W, H, W_NBV, H_NBV
+from splat_viewer_nbv import SplatViewer
+from voxel_grid_nbv import VoxelGrid
+from rviz_publisher_nbv import RVizPublisher
 
 
 class ActiveMapperNode(Node):
@@ -70,12 +75,12 @@ class ActiveMapperNode(Node):
         self.declare_parameter('gimbal_pitch_1', -15.0)
         self.declare_parameter('gimbal_pitch_2', -30.0)
         self.declare_parameter('gimbal_pitch_3', -5.0)
-        self.declare_parameter('orbit_waypoints', 36)
+        self.declare_parameter('orbit_waypoints', 24)
         self.declare_parameter('orbit_radius', 2.0)
-        self.declare_parameter('settle_time', 0.8)
+        self.declare_parameter('settle_time', 1.0)  # seconds in SIM time
         self.declare_parameter('max_gaussians', 500000)
-        self.declare_parameter('iters_per_keyframe', 500)
-        self.declare_parameter('window_size', 10)
+        self.declare_parameter('iters_per_keyframe', 2000)
+        self.declare_parameter('window_size', 0)
         self.declare_parameter('pts_per_frame', 40000)
         self.declare_parameter('kf_dist_threshold', 0.3)
         self.declare_parameter('kf_rot_threshold', 10.0)
@@ -101,21 +106,67 @@ class ActiveMapperNode(Node):
         self.densify_every = int(self.get_parameter('densify_every').value)
         self.enable_viewer = self.get_parameter('enable_viewer').value
 
-        # Orbit passes: (altitude_m, gimbal_pitch_deg) — 2 passes
+        # Orbit pass (single orbit as prior)
+        self.orbit_alt = self.get_parameter('orbit_altitude_1').value
+        self.orbit_pitch_deg = self.get_parameter('gimbal_pitch_1').value
         self.passes = [
-            (self.get_parameter('orbit_altitude_1').value,
-             self.get_parameter('gimbal_pitch_1').value),
-            (self.get_parameter('orbit_altitude_2').value,
-             self.get_parameter('gimbal_pitch_2').value),
+            (self.orbit_alt, self.orbit_pitch_deg),
         ]
         self.radius = self.get_parameter('orbit_radius').value
 
+        # ── NBV planner (bbox-alpha + angular diversity) ──
+        self.declare_parameter('kf_budget', 48)
+        self.declare_parameter('seed_kfs', 4)
+        self.declare_parameter('batch_size', 4)
+        self.declare_parameter('nbv_n_azimuth', 12)
+        self.declare_parameter('nbv_k', 24)
+        self.declare_parameter('offline_iters', 30000)
+        self.declare_parameter('offline_max_gaussians', 1000000)
+        self.declare_parameter('offline_train_scale', 2)
+        self.declare_parameter('skip_adaptive', False)
+        self.kf_budget = int(self.get_parameter('kf_budget').value)
+        self.seed_kfs = int(self.get_parameter('seed_kfs').value)
+        self.batch_size = int(self.get_parameter('batch_size').value)
+        self.nbv_k = int(self.get_parameter('nbv_k').value)
+        self.skip_adaptive = bool(self.get_parameter('skip_adaptive').value)
+
+        from nbv_planner import NBVPlanner
+        self.planner = NBVPlanner(
+            rock_ned=self.rock_ned.tolist(),
+            radius=self.radius,
+            min_altitude=0.3,
+            bbox_size=self.bbox_size,
+        )
+
+        # Adaptive budget = total - seed
+        self.adaptive_budget = self.kf_budget - self.seed_kfs
+        self.nbv_batch_count = 0  # KFs captured in current NBV batch
+        self.nbv_round = 0        # which scoring round we're on
+
+        self.get_logger().info(
+            f'NBV planner: {self.planner.n_candidates} candidates, '
+            f'seed={self.seed_kfs} KFs, '
+            f'adaptive={self.adaptive_budget} KFs '
+            f'(batches of {self.batch_size})'
+            f'{" (SKIPPED — seed-only baseline)" if self.skip_adaptive else ""}')
+
+        # NBV state
+        self.nbv_target = None
+        self.nbv_queue = []          # current batch of viewpoints to visit
+        self.nbv_training_done = threading.Event()
+        self.scoring_ready = threading.Event()  # set when optimizer has processed seed
+        self.avoid_waypoint = None          # Phase 1: climb at current XY
+        self.avoid_waypoint_transit = None  # Phase 2: transit at safe alt
+        self.avoid_approach = None          # Phase 3: descend at cylinder edge
+
+        # Per-round tracking for debugging and convergence analysis
+        self.round_history = []  # appended after each scoring round
+
         # -- Output directory --
-        # Workspace root: <ws>/install/mapping/share/mapping/scripts/active_recon/this.py -> <ws>
+        # Workspace root: <ws>/install/nbv/share/nbv/scripts/this.py -> <ws>
         self.ws_root = os.path.dirname(os.path.dirname(os.path.dirname(
-            os.path.dirname(os.path.dirname(os.path.dirname(
-                os.path.abspath(__file__)))))))
-        data_base = os.path.join(self.ws_root, 'data', 'mapping')
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
+        data_base = os.path.join(self.ws_root, 'data', 'nbv')
         os.makedirs(data_base, exist_ok=True)
         run_num = 1
         while os.path.exists(os.path.join(data_base, f'run_{run_num:03d}')):
@@ -143,13 +194,16 @@ class ActiveMapperNode(Node):
         self.gpu_info = self._collect_gpu_info(torch)
 
         # -- Components --
+        self.rock_ned_original = self.rock_ned.copy()
+
         self.gs_model = GaussianModel3DGS(
             max_gaussians=int(self.get_parameter('max_gaussians').value),
             pts_per_frame=int(self.get_parameter('pts_per_frame').value),
-            bbox_center=self.rock_ned,
-            bbox_size=self.bbox_size)
+            bbox_center=self.rock_ned_original,
+            bbox_size=self.bbox_size,
+            train_scale=2)  # 640/2=320, 480/2=240 — run 072 setting
         self.voxels = VoxelGrid(
-            self.rock_ned, self.bbox_size, self.voxel_res)
+            self.rock_ned_original, self.bbox_size, self.voxel_res)
         self.rviz = RVizPublisher(self)
 
         # -- State (must be initialized before threads start) --
@@ -163,7 +217,7 @@ class ActiveMapperNode(Node):
         # -- ROS setup --
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST, depth=1)
 
         self.offboard_pub = self.create_publisher(
@@ -201,13 +255,22 @@ class ActiveMapperNode(Node):
 
         # -- Optimizer thread communication --
         self.kf_queue = queue.Queue()
+        self.optimizer_active = True  # set False after NBV scoring
+
+        # -- Depth keyframes (kept for potential future use) --
+        self.depth_keyframes = []  # list of {'depth_np': HxW, 'viewmat_np': 4x4}
+        self.depth_keyframes_lock = threading.Lock()
         self.opt_thread = threading.Thread(
             target=self._optimizer_loop, daemon=True)
 
         self.counter = 0
         self.current_pass = 0
         self.settle_start = None
+        self.gimbal_yaw_rad = 0.0
+        self._ned_calibrated = False
+        self._gimbal_set = False
         self.kf_count = 0
+        self._all_view_positions = []  # shared: optimizer writes, planner reads
         self.frames_meta = []
         self.saved = False
 
@@ -229,6 +292,8 @@ class ActiveMapperNode(Node):
 
         # Training round metrics (populated by optimizer thread)
         self.training_log = []
+        # Forgetting monitor: per-round PSNR on sentinel keyframes
+        self.forgetting_log = []  # [{round, sentinels: [{kf_id, psnr, l1}]}]
 
         # Keyframe capture metrics
         self.kf_metrics = []
@@ -316,7 +381,12 @@ class ActiveMapperNode(Node):
         msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
         self.offboard_pub.publish(msg)
 
-    def _pub_setpoint(self, x, y, z, yaw=float('nan')):
+    def _pub_setpoint(self, x, y, z, yaw=float('nan'), max_speed=None):
+        """Publish position setpoint — raw coordinates, PX4 handles trajectory.
+
+        Matches the projects/ version: no velocity limiting, no per-tick
+        position clamping.  PX4's position controller manages the approach.
+        """
         msg = TrajectorySetpoint()
         msg.position = [x, y, z]
         msg.velocity = [float('nan')] * 3
@@ -326,6 +396,91 @@ class ActiveMapperNode(Node):
         msg.yawspeed = float('nan')
         msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
         self.setpoint_pub.publish(msg)
+
+    def _path_needs_avoidance(self, target_pos):
+        """Check if straight-line path to target passes near the rock.
+
+        Two checks:
+          1. 3D point-to-segment distance (catches diagonal paths)
+          2. Horizontal (XY) point-to-segment distance (catches paths that
+             fly directly over the rock at altitude — the 3D check misses
+             these because vertical offset inflates the distance)
+
+        If either is too close, returns a climb-first waypoint.
+        """
+        if self.pos is None:
+            return None
+        A = np.array([self.pos.x, self.pos.y, self.pos.z])
+        B = np.array(target_pos, dtype=np.float64)
+        R = np.array(self.rock_ned, dtype=np.float64)
+
+        AB = B - A
+        seg_len_sq = np.dot(AB, AB)
+        if seg_len_sq < 0.01:
+            return None
+
+        # 3D distance check
+        t = np.clip(np.dot(R - A, AB) / seg_len_sq, 0.0, 1.0)
+        closest = A + t * AB
+        dist_3d = np.linalg.norm(closest - R)
+
+        # Horizontal (XY-only) distance check — critical for paths over rock
+        AB_xy = AB[:2]
+        seg_len_sq_xy = np.dot(AB_xy, AB_xy)
+        if seg_len_sq_xy > 0.01:
+            t_xy = np.clip(np.dot(R[:2] - A[:2], AB_xy) / seg_len_sq_xy,
+                           0.0, 1.0)
+            closest_xy = A[:2] + t_xy * AB_xy
+            dist_xy = np.linalg.norm(closest_xy - R[:2])
+        else:
+            dist_xy = np.linalg.norm(A[:2] - R[:2])
+
+        # Horizontal safety margin: half bbox + 1.5m clearance for props/drift
+        xy_margin = self.bbox_size / 2.0 + 1.5
+        needs_avoidance = dist_3d < self.bbox_size or dist_xy < xy_margin
+
+        if needs_avoidance:
+            # Safe alt: bbox_size + 1m above rock center (extra margin)
+            safe_alt = self.rock_ned[2] - self.bbox_size - 1.0
+            yaw = math.atan2(
+                target_pos[1] - self.pos.y,
+                target_pos[0] - self.pos.x)
+            reason = (f'3D={dist_3d:.1f}m' if dist_3d < self.bbox_size
+                      else f'XY={dist_xy:.1f}m<{xy_margin:.1f}m')
+            self.get_logger().info(
+                f'Path avoidance ({reason}): '
+                f'climbing to z={safe_alt:.1f} before transit')
+            return (float(A[0]), float(A[1]), float(safe_alt), float(yaw))
+        return None
+
+    def _target_above_rock(self, target_pos):
+        """Check if target is within the rock's vertical cylinder.
+
+        Returns an approach waypoint at the cylinder edge if the target
+        is too close horizontally, or None if the target is clear.
+        """
+        hs = self.bbox_size / 2.0
+        horiz_clearance = 1.5  # meters outside bbox edge
+        dx = target_pos[0] - self.rock_ned[0]
+        dy = target_pos[1] - self.rock_ned[1]
+        horiz_dist = math.sqrt(dx * dx + dy * dy)
+        safe_radius = hs + horiz_clearance
+
+        if horiz_dist < safe_radius:
+            # Target is above/near rock — approach from outside the cylinder
+            # at target altitude, same azimuth
+            az = math.atan2(dy, dx)
+            approach_x = self.rock_ned[0] + safe_radius * math.cos(az)
+            approach_y = self.rock_ned[1] + safe_radius * math.sin(az)
+            approach_z = float(target_pos[2])
+            yaw = math.atan2(
+                self.rock_ned[1] - approach_y,
+                self.rock_ned[0] - approach_x)
+            self.get_logger().info(
+                f'Target above rock (horiz={horiz_dist:.1f}m < {safe_radius:.1f}m): '
+                f'approaching from cylinder edge at r={safe_radius:.1f}m')
+            return (approach_x, approach_y, approach_z, yaw)
+        return None
 
     def _send_cmd(self, command, p1=0.0, p2=0.0, p7=0.0):
         msg = VehicleCommand()
@@ -360,9 +515,55 @@ class ActiveMapperNode(Node):
         self._send_cmd(VehicleCommand.VEHICLE_CMD_NAV_LAND)
         self.get_logger().info('LAND')
 
-    def _pub_gimbal(self, pitch_rad):
+    def _yaw_to_rock(self):
+        """Compute yaw from current position to rock center."""
+        return math.atan2(
+            self.rock_ned[1] - self.pos.y,
+            self.rock_ned[0] - self.pos.x)
+
+    def _pub_gimbal(self, pitch_rad, yaw_rad=0.0):
         self.gimbal_pitch_pub.publish(Float64(data=pitch_rad))
-        self.gimbal_yaw_pub.publish(Float64(data=0.0))
+        self.gimbal_yaw_pub.publish(Float64(data=yaw_rad))
+
+    def _set_gimbal_to_rock(self):
+        """Compute exact gimbal pitch from actual position to rock center.
+
+        Called ONCE when settled at a viewpoint.  Aims at the TOP of the
+        rock (center + half bbox upward) so the full rock stays in frame.
+        Minimum -15° to avoid seeing landing legs.
+        """
+        dx = self.rock_ned[0] - self.pos.x
+        dy = self.rock_ned[1] - self.pos.y
+        # Aim at top of rock: center Z minus half bbox (NED: up = negative)
+        aim_z = self.rock_ned[2] - self.bbox_size * 0.3
+        dz = aim_z - self.pos.z
+        horiz = math.sqrt(dx * dx + dy * dy)
+        if horiz > 0.1:
+            pitch = -math.atan2(dz, horiz)
+            self.gimbal_pitch_rad = min(pitch, math.radians(-15))
+        self.get_logger().debug(
+            f'Gimbal pitch set to {math.degrees(self.gimbal_pitch_rad):.1f}°')
+
+    @staticmethod
+    def _pitch_for_elevation(elev_deg):
+        """Fallback pitch from elevation tier (used before settling)."""
+        if elev_deg < 20:
+            return math.radians(-15)
+        elif elev_deg < 40:
+            return math.radians(-25)
+        elif elev_deg < 60:
+            return math.radians(-35)
+        else:
+            return math.radians(-45)
+
+    def _yaw_error_to_rock(self):
+        """Absolute yaw error between drone heading and rock direction."""
+        if self.pos is None:
+            return math.pi
+        desired = self._yaw_to_rock()
+        err = desired - self.pos.heading
+        # Wrap to [-π, π] and return absolute
+        return abs(math.atan2(math.sin(err), math.cos(err)))
 
     # ── Phase timing ───────────────────────────────────────
 
@@ -395,7 +596,9 @@ class ActiveMapperNode(Node):
 
     def _setup_pass(self, idx):
         alt, pitch_deg = self.passes[idx]
-        self.alt_ned = -abs(alt)
+        # Altitude above rock center (NED: negative = up)
+        # rock_z_ned is already negative; subtract orbit alt to go higher
+        self.alt_ned = self.rock_ned[2] - abs(alt)
         self.gimbal_pitch_rad = math.radians(pitch_deg)
         self.waypoints = self._build_waypoints()
         self.wp_idx = 0
@@ -422,6 +625,12 @@ class ActiveMapperNode(Node):
 
     def _now_sec(self):
         return self.get_clock().now().nanoseconds * 1e-9
+
+    def _sim_sec(self):
+        """PX4 simulation time in seconds (RTF-independent)."""
+        if self.pos is not None:
+            return self.pos.timestamp * 1e-6   # µs → s
+        return self._now_sec()  # fallback to wall clock
 
     # ── Keyframe capture ───────────────────────────────────
 
@@ -457,6 +666,8 @@ class ActiveMapperNode(Node):
             return
 
         depth_np = self.bridge.imgmsg_to_cv2(self.latest_depth, 'passthrough')
+        if depth_np.shape[:2] != (H, W):
+            return
 
         # Save to disk
         cv2.imwrite(os.path.join(self.img_dir, f'{idx_str}.png'), rgb_np)
@@ -466,7 +677,7 @@ class ActiveMapperNode(Node):
 
         t_save = time.perf_counter()
 
-        # Compute viewmat
+        # Compute viewmat from body heading (gimbal yaw is always 0)
         viewmat = GaussianModel3DGS.compute_viewmat(
             px, py, pz, yaw, self.gimbal_pitch_rad)
 
@@ -479,6 +690,13 @@ class ActiveMapperNode(Node):
         # Update voxel grid
         self.voxels.update_from_depth(depth_clean, viewmat)
 
+        # Store depth keyframe
+        with self.depth_keyframes_lock:
+            self.depth_keyframes.append({
+                'depth_np': depth_clean.copy(),
+                'viewmat_np': viewmat.copy(),
+            })
+
         t_voxel = time.perf_counter()
 
         # Metadata
@@ -486,21 +704,19 @@ class ActiveMapperNode(Node):
             'file_path': f'images/{idx_str}.png',
             'depth_path': f'depth/{idx_str}.png',
             'position_ned': [px, py, pz],
-            'heading': float(self.pos.heading),
+            'heading': yaw,
             'gimbal_pitch': self.gimbal_pitch_rad,
         })
 
-        # Queue for optimizer (downsample to training resolution)
+        # Queue for optimizer (always — live training throughout)
         rgb_f = cv2.cvtColor(rgb_np, cv2.COLOR_BGR2RGB).astype(
             np.float32) / 255.0
-        s = self.gs_model.train_scale
-        if s > 1:
-            h_t, w_t = self.gs_model.H_train, self.gs_model.W_train
-            rgb_f = cv2.resize(rgb_f, (w_t, h_t), interpolation=cv2.INTER_AREA)
-            depth_train = cv2.resize(
-                depth_clean, (w_t, h_t), interpolation=cv2.INTER_NEAREST)
-        else:
-            depth_train = depth_clean
+        h_t, w_t = self.gs_model.H_train, self.gs_model.W_train
+        if rgb_f.shape[:2] != (h_t, w_t):
+            rgb_f = cv2.resize(
+                rgb_f, (w_t, h_t), interpolation=cv2.INTER_AREA)
+        depth_train = cv2.resize(
+            depth_clean, (w_t, h_t), interpolation=cv2.INTER_NEAREST)
         self.kf_queue.put({
             'rgb': rgb_f,
             'depth': depth_train,
@@ -547,29 +763,38 @@ class ActiveMapperNode(Node):
             self.phase, coverage,
             self.gs_model.n_gaussians, self.kf_count)
 
+        yaw_err_deg = math.degrees(self._yaw_error_to_rock())
         self.get_logger().info(
             f'KF {self.kf_count}: pos=({px:.1f},{py:.1f},{pz:.1f}) '
+            f'yaw={math.degrees(yaw):.1f}° '
+            f'body={math.degrees(self.pos.heading):.1f}° '
+            f'err={yaw_err_deg:.1f}° '
+            f'pitch={math.degrees(self.gimbal_pitch_rad):.1f}° '
             f'pts={len(pts_world)} cov={coverage:.0%} '
             f'[{(t_end-t_start)*1000:.0f}ms]')
 
     # ── Spatial window selection ────────────────────────────
 
     def _select_spatial_window(self, all_views, query_pos):
-        """Select the window_size nearest views by camera position distance.
+        """Select training views for the current round.
 
-        Carlos's idea: instead of last-N-by-time, pick the N keyframes
-        whose camera positions are closest to the new keyframe. This
-        ensures training uses spatially coherent views that see similar
-        geometry, even across different orbit passes.
+        If window_size == 0: use ALL views (no windowing). This prevents
+        catastrophic forgetting when NBV sends the drone to diverse,
+        spread-out viewpoints.
+
+        If window_size > 0: pick the N nearest views by camera position
+        distance (spatial window). This was designed for structured orbits
+        with correlated nearby views but causes forgetting with NBV.
 
         Args:
             all_views: list of (rgb_t, depth_t, vm_t, position) tuples
             query_pos: np.array [3] — position of the new keyframe
 
         Returns:
-            list of (rgb_t, depth_t, vm_t, position) tuples, length <= window_size
+            list of (rgb_t, depth_t, vm_t, position) tuples
         """
-        if len(all_views) <= self.window_size:
+        # window_size=0 means use all views (no windowing)
+        if self.window_size <= 0 or len(all_views) <= self.window_size:
             return list(all_views)
 
         # Compute distances from query to all views
@@ -598,10 +823,10 @@ class ActiveMapperNode(Node):
         last_per_iter_ms = 0.0  # for adaptive iteration budgeting
 
         while rclpy.ok():
-            # After landing: stop immediately (current round already finished)
-            if self.phase == 'DONE':
+            # Stop after current round when drone has landed
+            if self.phase in ('DONE', 'FINISHING') or not self.optimizer_active:
                 self.get_logger().info(
-                    f'Optimizer stopping — {self.kf_queue.qsize()} queued KFs discarded')
+                    f'Optimizer finished — final round complete')
                 break
 
             max_kfs_per_round = 4  # stay incremental — don't drain entire queue
@@ -638,6 +863,7 @@ class ActiveMapperNode(Node):
                 vm_t = torch.from_numpy(kf['viewmat']).to(device)
                 pos = kf['position']
                 all_views.append((rgb_t, depth_t, vm_t, pos))
+                self._all_view_positions.append(pos)
                 latest_pos = pos
 
                 if len(kf['pts_world']) > 0:
@@ -674,13 +900,8 @@ class ActiveMapperNode(Node):
             n_views = len(views)
             n_gaussians_before = self.gs_model.n_gaussians
 
-            # Adaptive iteration count: cap round time at ~8s to keep up
-            # with drone movement. Use last round's per-iter time to budget.
-            target_round_ms = 8000.0
-            effective_iters = self.iters_per_kf
-            if last_per_iter_ms > 0:
-                budget_iters = int(target_round_ms / last_per_iter_ms)
-                effective_iters = max(50, min(self.iters_per_kf, budget_iters))
+            # Scale iters with view count: ~40 passes/view, floor 750, cap 2000.
+            effective_iters = min(2500, max(750, n_views * 50))
 
             self.get_logger().info(
                 f'Training {self.gs_model.n_gaussians} gaussians over '
@@ -690,20 +911,19 @@ class ActiveMapperNode(Node):
 
             vram_before = self._get_vram_stats()
 
-            # Single-view training: cycle through spatial window views,
-            # with random replay from older views for forgetting prevention.
+            # Shuffle views each epoch — run 072 config (best result).
             iter_losses = []
             t_train_start = time.perf_counter()
             try:
-                for it in range(effective_iters):
-                    # Cycle through window views
-                    vi = it % n_views
-                    rgb_gt, depth_gt, vm, _ = views[vi]
+                view_order = list(range(n_views))
+                random.shuffle(view_order)
 
-                    # 50% chance: swap in a random replay view
-                    if len(all_views) > n_views and random.random() < 0.5:
-                        ri = random.randint(0, len(all_views) - 1)
-                        rgb_gt, depth_gt, vm, _ = all_views[ri]
+                for it in range(effective_iters):
+                    epoch_pos = it % n_views
+                    if epoch_pos == 0 and it > 0:
+                        random.shuffle(view_order)
+                    vi = view_order[epoch_pos]
+                    rgb_gt, depth_gt, vm, _ = views[vi]
 
                     loss = self.gs_model._train_single_view(
                         vm, rgb_gt, depth_gt)
@@ -730,8 +950,9 @@ class ActiveMapperNode(Node):
 
             # Densify/prune periodically — stop after 70% of expected rounds
             # (Kerbl et al.: densify iters 500–15K out of 30K)
-            n_passes = len(self.passes)
-            expected_total_rounds = self.n_wp * n_passes
+            # With fully adaptive: expect kf_budget/batch_size rounds
+            expected_total_rounds = max(
+                self.kf_budget // max(1, self.batch_size), 4)
             densify_until_round = int(0.7 * expected_total_rounds)
             t_densify_start = time.perf_counter()
             did_densify = False
@@ -763,6 +984,47 @@ class ActiveMapperNode(Node):
                         gt_np, rd_np, data_range=1.0, channel_axis=2))
             except Exception:
                 pass
+
+            # ── Forgetting monitor: re-render ALL keyframes ──
+            # Produces complete forgetting matrix: KF × Round → metrics.
+            # Each render is ~7ms, 48 KFs = ~336ms overhead per round.
+            sentinel_metrics = []
+            n_total = len(all_views)
+            if n_total >= 2 and self.gs_model.means is not None:
+                try:
+                    # Track which views were in window vs replay
+                    window_set = set(id(v) for v in views)
+                    for sid in range(n_total):
+                        s_rgb_gt, _, s_vm, _ = all_views[sid]
+                        s_rendered = self.gs_model.render_train_res(
+                            s_vm.cpu().numpy())
+                        s_gt_np = s_rgb_gt.cpu().numpy()
+                        if s_gt_np.max() > 1.0:
+                            s_gt_np = s_gt_np / 255.0
+                        s_rd_np = s_rendered.astype(np.float64) / 255.0
+                        s_gt_np = s_gt_np.astype(np.float64)
+                        s_psnr = float(psnr_fn(
+                            s_gt_np, s_rd_np, data_range=1.0))
+                        s_ssim = float(ssim_fn(
+                            s_gt_np, s_rd_np, data_range=1.0,
+                            channel_axis=2))
+                        s_l1 = float(np.mean(np.abs(s_gt_np - s_rd_np)))
+                        in_window = id(all_views[sid]) in window_set
+                        sentinel_metrics.append({
+                            'kf_id': sid,
+                            'psnr': s_psnr,
+                            'ssim': s_ssim,
+                            'l1': s_l1,
+                            'in_window': in_window,
+                        })
+                except Exception:
+                    pass  # don't break training if monitor fails
+
+            self.forgetting_log.append({
+                'round': rounds,
+                'n_keyframes_total': n_total,
+                'sentinels': sentinel_metrics,
+            })
 
             # Update viewer
             if self.viewer is not None:
@@ -876,7 +1138,18 @@ class ActiveMapperNode(Node):
                 'window_size': self.window_size,
                 'pts_per_frame': int(self.get_parameter('pts_per_frame').value),
                 'densify_every': self.densify_every,
+                'seed_kfs': self.seed_kfs,
+                'batch_size': self.batch_size,
+                'nbv_k': self.nbv_k,
+                'nbv_rounds': self.nbv_round,
+                'skip_adaptive': self.skip_adaptive,
+                'offline_iters': int(self.get_parameter('offline_iters').value),
+                'offline_max_gaussians': int(
+                    self.get_parameter('offline_max_gaussians').value),
+                'offline_train_scale': int(
+                    self.get_parameter('offline_train_scale').value),
             },
+            'nbv_analysis': self.planner.last_analysis,
             'mission': {
                 'duration_s': mission_duration,
                 'n_keyframes': self.kf_count,
@@ -891,6 +1164,7 @@ class ActiveMapperNode(Node):
             'phase_times': self.phase_times,
             'training_rounds': self.training_log,
             'keyframe_metrics': self.kf_metrics,
+            'forgetting_monitor': self.forgetting_log,
             'battery_log': self.battery_log,
             'vram_final': self._get_vram_stats(),
         }
@@ -902,9 +1176,21 @@ class ActiveMapperNode(Node):
                 self.model_dir, 'training_log.json'), 'w') as f:
             json.dump(self.training_log, f, indent=2)
 
+        # Save forgetting monitor separately
+        with open(os.path.join(
+                self.model_dir, 'forgetting_log.json'), 'w') as f:
+            json.dump(self.forgetting_log, f, indent=2)
+
+        # Save NBV planner analysis
+        self.planner.save_analysis(self.nbv_dir)
+
         self.saved = True
         self.get_logger().info(
             f'=== SAVED {self.kf_count} frames to {self.run_dir} ===')
+        self.get_logger().info(
+            f'  Seed: {self.seed_kfs} KFs, '
+            f'Adaptive: {self.kf_count - self.seed_kfs} KFs '
+            f'({self.nbv_round} scoring rounds)')
         stats = self.voxels.get_stats()
         self.get_logger().info(
             f'Coverage: {stats["coverage_pct"]:.0%} '
@@ -914,7 +1200,7 @@ class ActiveMapperNode(Node):
             f'{self.gs_model.n_gaussians} gaussians, '
             f'loss={self.gs_model.last_loss:.4f}')
 
-        # Generate evaluation outputs in background
+        # Generate evaluation + offline reconstruction
         threading.Thread(
             target=self._generate_evaluation, daemon=True).start()
 
@@ -1166,6 +1452,194 @@ class ActiveMapperNode(Node):
                 plt.close()
                 self.get_logger().info('Saved eval/battery.png')
 
+            # ── 7b. Forgetting monitor curves ──
+            forgetting_snap = list(self.forgetting_log)
+            if forgetting_snap and any(
+                    len(r['sentinels']) > 0 for r in forgetting_snap):
+                # Collect per-sentinel time series
+                # Each sentinel is identified by its kf_id at each round
+                # Build {kf_id: [(round, psnr, l1), ...]}
+                sentinel_traces = {}
+                for entry in forgetting_snap:
+                    rd = entry['round']
+                    for s in entry['sentinels']:
+                        sid = s['kf_id']
+                        if sid not in sentinel_traces:
+                            sentinel_traces[sid] = {
+                                'rounds': [], 'psnr': [], 'l1': []}
+                        sentinel_traces[sid]['rounds'].append(rd)
+                        sentinel_traces[sid]['psnr'].append(s['psnr'])
+                        sentinel_traces[sid]['l1'].append(s['l1'])
+
+                if sentinel_traces:
+                    fig, (ax1, ax2) = plt.subplots(
+                        2, 1, figsize=(12, 8), sharex=True)
+
+                    # Determine pass boundary for vertical line
+                    n_wp = self.n_wp
+                    pass_boundary_round = None
+                    for entry in forgetting_snap:
+                        if entry['n_keyframes_total'] > n_wp:
+                            pass_boundary_round = entry['round']
+                            break
+
+                    colors_map = plt.cm.tab10
+                    for i, (sid, trace) in enumerate(
+                            sorted(sentinel_traces.items())):
+                        color = colors_map(i % 10)
+                        label = f'KF {sid}'
+                        ax1.plot(trace['rounds'], trace['psnr'],
+                                 '-o', color=color, label=label,
+                                 markersize=3, linewidth=1.5)
+                        ax2.plot(trace['rounds'], trace['l1'],
+                                 '-o', color=color, label=label,
+                                 markersize=3, linewidth=1.5)
+
+                    # Mark pass transition
+                    if pass_boundary_round is not None:
+                        for ax in (ax1, ax2):
+                            ax.axvline(
+                                x=pass_boundary_round, color='red',
+                                linestyle='--', linewidth=2,
+                                label='Pass 2 starts'
+                                if ax == ax1 else None)
+
+                    ax1.set_ylabel('PSNR (dB)')
+                    ax1.set_title(
+                        'Forgetting Monitor — Sentinel Keyframe Quality '
+                        'Over Training Rounds')
+                    ax1.legend(fontsize=8, ncol=2)
+                    ax1.grid(True, alpha=0.3)
+
+                    ax2.set_xlabel('Training Round')
+                    ax2.set_ylabel('L1 Error')
+                    ax2.set_title('L1 Error of Sentinel Keyframes Over Time')
+                    ax2.legend(fontsize=8, ncol=2)
+                    ax2.grid(True, alpha=0.3)
+
+                    plt.tight_layout()
+                    plt.savefig(
+                        os.path.join(self.eval_dir, 'forgetting_curves.png'),
+                        dpi=150)
+                    plt.close()
+                    self.get_logger().info(
+                        'Saved eval/forgetting_curves.png')
+
+                    # Also save a summary: peak PSNR vs final PSNR per sentinel
+                    forgetting_summary = []
+                    for sid, trace in sorted(sentinel_traces.items()):
+                        peak_psnr = max(trace['psnr'])
+                        peak_round = trace['rounds'][
+                            trace['psnr'].index(peak_psnr)]
+                        final_psnr = trace['psnr'][-1]
+                        forgetting_summary.append({
+                            'kf_id': sid,
+                            'peak_psnr': round(peak_psnr, 2),
+                            'peak_at_round': peak_round,
+                            'final_psnr': round(final_psnr, 2),
+                            'psnr_drop': round(peak_psnr - final_psnr, 2),
+                            'peak_l1': round(min(trace['l1']), 4),
+                            'final_l1': round(trace['l1'][-1], 4),
+                        })
+                    with open(os.path.join(
+                            self.eval_dir, 'forgetting_summary.json'),
+                            'w') as f:
+                        json.dump(forgetting_summary, f, indent=2)
+                    self.get_logger().info(
+                        'Saved eval/forgetting_summary.json')
+
+                # ── 7b. Forgetting heatmap (KF × Round → PSNR) ──
+                try:
+                    # Build matrix from forgetting_log (now has ALL KFs)
+                    all_rounds = sorted(sentinel_traces.keys()
+                                        if not sentinel_traces
+                                        else set().union(
+                                            *[set(t['rounds'])
+                                              for t in sentinel_traces.values()]))
+                    # Actually build from forgetting_log directly
+                    if self.forgetting_log:
+                        round_nums = [e['round'] for e in self.forgetting_log]
+                        all_kf_ids = sorted(set(
+                            s['kf_id'] for e in self.forgetting_log
+                            for s in e['sentinels']))
+                        if all_kf_ids and round_nums:
+                            matrix = np.full(
+                                (len(all_kf_ids), len(round_nums)),
+                                np.nan)
+                            kf_idx = {k: i for i, k in enumerate(all_kf_ids)}
+                            for ri, entry in enumerate(self.forgetting_log):
+                                for s in entry['sentinels']:
+                                    if s['kf_id'] in kf_idx:
+                                        matrix[kf_idx[s['kf_id']], ri] = \
+                                            s['psnr']
+
+                            fig, ax = plt.subplots(figsize=(14, 8))
+                            im = ax.imshow(
+                                matrix, aspect='auto', cmap='RdYlGn',
+                                vmin=8, vmax=35, interpolation='nearest')
+                            ax.set_xlabel('Training Round')
+                            ax.set_ylabel('Keyframe ID')
+                            ax.set_title(
+                                'Forgetting Heatmap: Per-KF PSNR Across '
+                                'Training Rounds')
+                            ax.set_xticks(range(len(round_nums)))
+                            ax.set_xticklabels(round_nums, fontsize=7)
+                            ax.set_yticks(range(len(all_kf_ids)))
+                            ax.set_yticklabels(all_kf_ids, fontsize=7)
+                            plt.colorbar(im, label='PSNR (dB)')
+                            plt.tight_layout()
+                            plt.savefig(
+                                os.path.join(self.eval_dir,
+                                             'forgetting_heatmap.png'),
+                                dpi=150)
+                            plt.close()
+                            self.get_logger().info(
+                                'Saved eval/forgetting_heatmap.png')
+
+                            # Window membership heatmap
+                            has_window = any(
+                                'in_window' in s
+                                for e in self.forgetting_log
+                                for s in e['sentinels'])
+                            if has_window:
+                                win_matrix = np.full(
+                                    (len(all_kf_ids), len(round_nums)),
+                                    0.0)
+                                for ri, entry in enumerate(
+                                        self.forgetting_log):
+                                    for s in entry['sentinels']:
+                                        if s['kf_id'] in kf_idx:
+                                            win_matrix[
+                                                kf_idx[s['kf_id']], ri] = \
+                                                1.0 if s.get(
+                                                    'in_window', False) \
+                                                else 0.5
+                                fig2, ax2 = plt.subplots(figsize=(14, 8))
+                                ax2.imshow(
+                                    win_matrix, aspect='auto',
+                                    cmap='RdYlGn', vmin=0, vmax=1,
+                                    interpolation='nearest')
+                                ax2.set_xlabel('Training Round')
+                                ax2.set_ylabel('Keyframe ID')
+                                ax2.set_title(
+                                    'Window Membership: Green=In Window, '
+                                    'Yellow=Replay/Excluded')
+                                ax2.set_xticks(range(len(round_nums)))
+                                ax2.set_xticklabels(round_nums, fontsize=7)
+                                ax2.set_yticks(range(len(all_kf_ids)))
+                                ax2.set_yticklabels(all_kf_ids, fontsize=7)
+                                plt.tight_layout()
+                                plt.savefig(
+                                    os.path.join(self.eval_dir,
+                                                 'window_membership.png'),
+                                    dpi=150)
+                                plt.close()
+                                self.get_logger().info(
+                                    'Saved eval/window_membership.png')
+                except Exception as e:
+                    self.get_logger().warning(
+                        f'Heatmap generation failed: {e}')
+
             # ── 8. Reconstruction quality (per-keyframe + novel views) ──
             from skimage.metrics import structural_similarity as ssim_fn
             from skimage.metrics import peak_signal_noise_ratio as psnr_fn
@@ -1176,7 +1650,20 @@ class ActiveMapperNode(Node):
             os.makedirs(os.path.join(recon_dir, 'novel_views'), exist_ok=True)
             os.makedirs(os.path.join(recon_dir, 'error_maps'), exist_ok=True)
 
-            # 8a. Per-keyframe PSNR/SSIM on ALL training keyframes
+            # 8a. Per-keyframe PSNR/SSIM/L1/LPIPS on ALL training keyframes
+            # LPIPS (Learned Perceptual Image Patch Similarity) measures
+            # perceptual distance using VGG features — better correlates
+            # with human judgement than pixel-level metrics.
+            import torch as _torch
+            lpips_model = None
+            try:
+                import lpips
+                lpips_model = lpips.LPIPS(net='vgg').to('cuda')
+                lpips_model.eval()
+            except Exception:
+                self.get_logger().warning(
+                    'LPIPS not available, skipping perceptual metric')
+
             kf_metrics_list = []
             for idx in range(self.kf_count):
                 frame = self.frames_meta[idx]
@@ -1195,13 +1682,24 @@ class ActiveMapperNode(Node):
                 kf_psnr = float(psnr_fn(gt_f, rd_f, data_range=1.0))
                 kf_ssim = float(ssim_fn(
                     gt_f, rd_f, data_range=1.0, channel_axis=2))
-                # L1 error
                 kf_l1 = float(np.mean(np.abs(gt_f - rd_f)))
+                # LPIPS (lower = better, 0 = identical)
+                kf_lpips = -1.0
+                if lpips_model is not None:
+                    with _torch.no_grad():
+                        gt_t = _torch.from_numpy(
+                            gt_f.astype(np.float32)).permute(
+                            2, 0, 1).unsqueeze(0).to('cuda') * 2 - 1
+                        rd_t = _torch.from_numpy(
+                            rd_f.astype(np.float32)).permute(
+                            2, 0, 1).unsqueeze(0).to('cuda') * 2 - 1
+                        kf_lpips = float(lpips_model(gt_t, rd_t).item())
                 kf_metrics_list.append({
                     'keyframe': idx,
                     'psnr': kf_psnr,
                     'ssim': kf_ssim,
                     'l1': kf_l1,
+                    'lpips': kf_lpips,
                     'pass': idx // self.n_wp if self.n_wp > 0 else 0,
                 })
 
@@ -1385,17 +1883,21 @@ class ActiveMapperNode(Node):
                                   for p in sorted(pass_stats.keys())]
                 pass_data_ssim = [pass_stats[p]['ssim']
                                   for p in sorted(pass_stats.keys())]
-                pass_labels = [f'Pass {p+1}\n({self.passes[p][0]}m, '
-                               f'{self.passes[p][1]}°)'
-                               for p in sorted(pass_stats.keys())
-                               if p < len(self.passes)]
-                if pass_data_psnr:
-                    ax1.boxplot(pass_data_psnr, labels=pass_labels[:len(pass_data_psnr)])
+                pass_labels = []
+                for p in sorted(pass_stats.keys()):
+                    if p < len(self.passes):
+                        pass_labels.append(
+                            f'Pass {p+1}\n({self.passes[p][0]}m, '
+                            f'{self.passes[p][1]}°)')
+                    else:
+                        pass_labels.append(f'Pass {p+1}')
+                if pass_data_psnr and len(pass_labels) == len(pass_data_psnr):
+                    ax1.boxplot(pass_data_psnr, labels=pass_labels)
                     ax1.set_ylabel('PSNR (dB)')
                     ax1.set_title('PSNR Distribution by Pass')
                     ax1.grid(True, alpha=0.3)
-                if pass_data_ssim:
-                    ax2.boxplot(pass_data_ssim, labels=pass_labels[:len(pass_data_ssim)])
+                if pass_data_ssim and len(pass_labels) == len(pass_data_ssim):
+                    ax2.boxplot(pass_data_ssim, labels=pass_labels)
                     ax2.set_ylabel('SSIM')
                     ax2.set_title('SSIM Distribution by Pass')
                     ax2.set_ylim(0, 1)
@@ -1568,6 +2070,9 @@ class ActiveMapperNode(Node):
                 f'({len(nbv_candidates)} candidates, '
                 f'top={nbv_candidates[0]["mean_alpha"]:.2f})')
 
+            # ── 9f. Per-round convergence analysis + 3D plot ──
+            self._generate_nbv_analysis()
+
             # ── 10. Summary text ──
             vram_final = self._get_vram_stats()
             summary_lines = [
@@ -1675,6 +2180,16 @@ class ActiveMapperNode(Node):
                     f'Median SSIM: {np.median(all_ssim):.4f}',
                     f'Min/Max SSIM: {np.min(all_ssim):.4f} / {np.max(all_ssim):.4f}',
                     f'Mean L1: {np.mean(all_l1):.6f}',
+                ])
+                all_lpips = [m['lpips'] for m in kf_metrics_list
+                             if m['lpips'] >= 0]
+                if all_lpips:
+                    summary_lines.extend([
+                        f'Mean LPIPS: {np.mean(all_lpips):.4f}',
+                        f'Median LPIPS: {np.median(all_lpips):.4f}',
+                        f'Min/Max LPIPS: {np.min(all_lpips):.4f} / {np.max(all_lpips):.4f}',
+                    ])
+                summary_lines.extend([
                     f'Evaluated on: {len(kf_metrics_list)} keyframes',
                 ])
                 for p in sorted(pass_stats.keys()):
@@ -1692,75 +2207,953 @@ class ActiveMapperNode(Node):
                 f.write(summary)
             self.get_logger().info('Saved eval/summary.txt')
             self.get_logger().info(
-                '=== Evaluation outputs complete. Shutting down. ===')
+                '=== Evaluation outputs complete. ===')
+
+            # Offline reconstruction is now run separately via:
+            #   bash postprocess.sh <run_dir>
+            self.get_logger().info(
+                f'Run dir: {self.run_dir}')
+            self.get_logger().info(
+                'Run offline reconstruction with: '
+                'bash postprocess.sh <run_dir>')
+
+            self.get_logger().info(
+                '=== All done. Shutting down. ===')
             # Wait for optimizer thread to finish, then force exit
             if hasattr(self, 'opt_thread') and self.opt_thread.is_alive():
                 self.opt_thread.join(timeout=15.0)
             os._exit(0)
 
         except Exception as e:
-            self.get_logger().error(f'Evaluation generation error: {e}')
+            self.get_logger().error(f'Evaluation/offline error: {e}')
             import traceback as tb
             self.get_logger().error(tb.format_exc())
-            os._exit(1)
+            self.get_logger().info('Exiting despite eval error — data is saved')
+            os._exit(0)
+
+    # ── Per-round metrics ─────────────────────────────────
+
+    def _save_round_metrics_bg(self, round_num, frames_snapshot, kf_count,
+                                n_gaussians, model_snapshot=None):
+        """Background: render vs GT images, error maps, PSNR/SSIM/L1 per KF.
+
+        Runs in a daemon thread so it never blocks PX4 offboard heartbeats.
+        Uses a snapshot of frames_meta/kf_count and model params taken at
+        call time to avoid race conditions with the optimizer thread.
+        """
+        try:
+            from skimage.metrics import structural_similarity as ssim_fn
+            from skimage.metrics import peak_signal_noise_ratio as psnr_fn
+        except ImportError:
+            self.get_logger().warning('skimage not available, skipping round metrics')
+            return
+
+        round_dir = os.path.join(self.nbv_dir, 'rounds',
+                                 f'round_{round_num:02d}')
+        os.makedirs(round_dir, exist_ok=True)
+        renders_dir = os.path.join(round_dir, 'renders')
+        os.makedirs(renders_dir, exist_ok=True)
+
+        kf_metrics = []
+        for idx in range(kf_count):
+            frame = frames_snapshot[idx]
+            gt_path = os.path.join(self.run_dir, frame['file_path'])
+            gt_img = cv2.imread(gt_path)
+            if gt_img is None:
+                continue
+            gt_rgb = cv2.cvtColor(gt_img, cv2.COLOR_BGR2RGB)
+
+            vm = GaussianModel3DGS.compute_viewmat(
+                *frame['position_ned'],
+                frame['heading'],
+                frame['gimbal_pitch'])
+            if model_snapshot is not None:
+                rendered = self.gs_model.render_from_snapshot(vm, model_snapshot)
+            else:
+                rendered = self.gs_model.render(vm)
+
+            gt_f = gt_rgb.astype(np.float64) / 255.0
+            rd_f = rendered.astype(np.float64) / 255.0
+
+            kf_psnr = float(psnr_fn(gt_f, rd_f, data_range=1.0))
+            kf_ssim = float(ssim_fn(
+                gt_f, rd_f, data_range=1.0, channel_axis=2))
+            kf_l1 = float(np.mean(np.abs(gt_f - rd_f)))
+
+            kf_metrics.append({
+                'kf': idx, 'psnr': kf_psnr,
+                'ssim': kf_ssim, 'l1': kf_l1,
+            })
+
+            # Save rendered + error for every keyframe
+            W = gt_img.shape[1]
+            rendered_bgr = cv2.cvtColor(rendered, cv2.COLOR_RGB2BGR)
+            err = np.abs(gt_f - rd_f)
+            err_vis = (err * 255 * 3).clip(0, 255).astype(np.uint8)
+            err_bgr = cv2.cvtColor(err_vis, cv2.COLOR_RGB2BGR)
+
+            # GT | Rendered | Error
+            combined = np.hstack([gt_img, rendered_bgr, err_bgr])
+            cv2.putText(combined, 'GT', (10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            cv2.putText(combined, 'Rendered', (W + 10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            cv2.putText(combined,
+                        f'Err PSNR={kf_psnr:.1f} SSIM={kf_ssim:.3f} L1={kf_l1:.4f}',
+                        (2 * W + 10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+            cv2.imwrite(os.path.join(renders_dir, f'kf_{idx:03d}.png'), combined)
+
+        # Aggregate metrics for this round
+        if kf_metrics:
+            all_psnr = [m['psnr'] for m in kf_metrics]
+            all_ssim = [m['ssim'] for m in kf_metrics]
+            all_l1 = [m['l1'] for m in kf_metrics]
+            summary = {
+                'round': round_num,
+                'n_kfs': kf_count,
+                'n_gaussians': n_gaussians,
+                'mean_psnr': float(np.mean(all_psnr)),
+                'median_psnr': float(np.median(all_psnr)),
+                'min_psnr': float(np.min(all_psnr)),
+                'max_psnr': float(np.max(all_psnr)),
+                'mean_ssim': float(np.mean(all_ssim)),
+                'mean_l1': float(np.mean(all_l1)),
+                'per_kf': kf_metrics,
+            }
+            with open(os.path.join(round_dir, 'metrics.json'), 'w') as f:
+                json.dump(summary, f, indent=2)
+            self.get_logger().info(
+                f'Round {round_num} quality: PSNR={np.mean(all_psnr):.1f} '
+                f'SSIM={np.mean(all_ssim):.3f} L1={np.mean(all_l1):.4f} '
+                f'({len(kf_metrics)} KFs)')
+
+        # Model checkpoint
+        ckpt_path = os.path.join(round_dir, 'model')
+        self.gs_model.save(ckpt_path)
+        self.get_logger().info(f'Saved round {round_num} checkpoint + metrics')
+
+    # ── NBV scoring (bbox-alpha + angular diversity) ─────────
+
+    def _run_nbv_scoring(self):
+        """Score candidates and pick next batch using bbox-alpha + angular diversity.
+
+        Called after seed completes and after every batch of captures.
+        Each call re-scores all candidates with the latest model,
+        picks the next batch_size viewpoints via greedy selection,
+        and queues them.  Records comprehensive per-round data.
+        """
+        self.nbv_round += 1
+
+        # Mark newly captured positions as visited
+        n_already_visited = len(self.planner.visited_positions)
+        for meta in self.frames_meta[n_already_visited:]:
+            self.planner.mark_visited(
+                np.array(meta['position_ned'], dtype=np.float32))
+
+        remaining = self.kf_budget - self.kf_count
+        batch = min(self.batch_size, remaining)
+        if batch <= 0:
+            self.get_logger().info('Budget exhausted, no more NBV scoring')
+            return
+
+        self.get_logger().info(
+            f'NBV round {self.nbv_round}: scoring {self.planner.n_candidates} '
+            f'candidates (model has {self.kf_count} KFs, '
+            f'{len(self.planner.visited_positions)} visited)...')
+
+        t_start = time.perf_counter()
+        start_pos = None
+        if self.pos is not None:
+            start_pos = np.array([
+                self.pos.x, self.pos.y, self.pos.z], dtype=np.float32)
+        phase_progress = self.kf_count / self.kf_budget if self.kf_budget > 0 else 0.5
+        top_k = self.planner.select_top_k(
+            self.gs_model, k=batch, start_pos=start_pos,
+            phase_progress=phase_progress)
+        t_end = time.perf_counter()
+        scoring_ms = (t_end - t_start) * 1000
+
+        if not top_k:
+            self.get_logger().warning('NBV scoring returned no candidates')
+            return
+
+        # Save raw planner analysis files per round
+        self.planner.save_analysis(
+            self.nbv_dir, suffix=f'_round{self.nbv_round:02d}')
+
+        analysis = self.planner.last_analysis
+        self.get_logger().info(
+            f'Geo uncert: mean={analysis["geo_uncertainty_mean"]:.3f}, '
+            f'max={analysis["geo_uncertainty_max"]:.3f}, '
+            f'angular: mean={analysis["angular_dist_mean"]:.3f}')
+        self.get_logger().info(
+            f'Score: mean={analysis["score_mean"]:.3f}, '
+            f'max={analysis["score_max"]:.3f}, '
+            f'phase={phase_progress:.1%}')
+
+        self.get_logger().info(
+            f'Scored in {scoring_ms:.0f}ms, '
+            f'picked {len(top_k)} for round {self.nbv_round}')
+
+        # ── Save per-round rendered vs GT comparisons + error maps ──
+        # Run in background thread to avoid blocking PX4 offboard heartbeats.
+        # Take a model snapshot NOW (on the optimizer thread where tensors are
+        # consistent) to avoid race conditions with densify/prune resizing.
+        frames_snap = [f.copy() for f in self.frames_meta[:self.kf_count]]
+        model_snapshot = self.gs_model.get_snapshot()
+        threading.Thread(
+            target=self._save_round_metrics_bg,
+            args=(self.nbv_round, frames_snap, self.kf_count,
+                  self.gs_model.n_gaussians, model_snapshot),
+            daemon=True,
+        ).start()
+
+        # ── Record per-round data for analysis ──
+        all_scores = []
+        if self.planner.last_scored:
+            for c in self.planner.last_scored:
+                all_scores.append({
+                    'index': c['index'],
+                    'azimuth_deg': float(c['azimuth_deg']),
+                    'elevation_deg': float(c['elevation_deg']),
+                    'altitude': float(c['altitude']),
+                    'score': float(c['score']),
+                    'geo_uncertainty': float(c['geo_uncertainty']),
+                    'score_bbox_uncov': float(c['score_bbox_uncov']),
+                    'score_angular': float(c['score_angular']),
+                    'bbox_area_frac': float(c['bbox_area_frac']),
+                })
+
+        selected_detail = []
+        for vp in top_k:
+            selected_detail.append({
+                'index': vp['index'],
+                'azimuth_deg': float(vp['azimuth_deg']),
+                'elevation_deg': float(vp['elevation_deg']),
+                'altitude': float(vp['altitude']),
+                'position': [float(v) for v in vp['position']],
+                'yaw': float(vp['yaw']),
+                'gimbal_pitch': float(vp['gimbal_pitch']),
+                'score': float(vp['score']),
+                'geo_uncertainty': float(vp['geo_uncertainty']),
+                'score_bbox_uncov': float(vp['score_bbox_uncov']),
+                'score_angular': float(vp['score_angular']),
+                'bbox_area_frac': float(vp['bbox_area_frac']),
+            })
+
+        latest_training = self.training_log[-1] if self.training_log else {}
+
+        round_data = {
+            'round': self.nbv_round,
+            'n_kfs_at_scoring': self.kf_count,
+            'n_kfs_after_batch': self.kf_count + len(top_k),
+            'batch_size': len(top_k),
+            'timestamp_s': self._now_sec() - (self.mission_start_time or 0),
+            'scoring_compute_ms': scoring_ms,
+            # Depth-variance geometric uncertainty + angular diversity
+            'n_gaussians': analysis.get('n_gaussians_total', 0),
+            'geo_uncertainty_mean': analysis.get('geo_uncertainty_mean', 0),
+            'geo_uncertainty_max': analysis.get('geo_uncertainty_max', 0),
+            'bbox_uncov_mean': analysis.get('bbox_uncov_mean', 0),
+            'bbox_uncov_max': analysis.get('bbox_uncov_max', 0),
+            'bbox_area_frac_mean': analysis.get('bbox_area_frac_mean', 0),
+            'angular_dist_mean': analysis.get('angular_dist_mean', 0),
+            'angular_dist_min': analysis.get('angular_dist_min', 0),
+            'phase_progress': analysis.get('phase_progress', 0),
+            # Score distribution
+            'score_max': analysis.get('score_max', 0),
+            'score_min': analysis.get('score_min', 0),
+            'score_mean': analysis.get('score_mean', 0),
+            'score_std': analysis.get('score_std', 0),
+            # Coverage
+            'coverage_pct': self.voxels.get_coverage_pct(),
+            # Training state
+            'training_loss': latest_training.get('loss_final', 0),
+            'training_psnr': latest_training.get('psnr', 0),
+            'training_ssim': latest_training.get('ssim', 0),
+            'training_rounds_completed': len(self.training_log),
+            # Visited positions
+            'n_visited': len(self.planner.visited_positions),
+            'visited_positions': [
+                [float(v) for v in pos]
+                for pos in self.planner.visited_positions],
+            # Selected viewpoints
+            'selected': selected_detail,
+            # All candidate scores
+            'all_candidate_scores': all_scores,
+        }
+
+        self.round_history.append(round_data)
+
+        rounds_dir = os.path.join(self.nbv_dir, 'rounds')
+        os.makedirs(rounds_dir, exist_ok=True)
+        with open(os.path.join(
+                rounds_dir,
+                f'round_{self.nbv_round:02d}.json'), 'w') as f:
+            json.dump(round_data, f, indent=2)
+
+        # Queue this batch
+        self.nbv_queue = list(top_k)
+        self.nbv_batch_count = 0
+        for i, vp in enumerate(self.nbv_queue[:6]):
+            self.get_logger().info(
+                f'  #{i+1}: az={vp["azimuth_deg"]:.0f}° '
+                f'el={vp["elevation_deg"]:.0f}° '
+                f'score={vp["score"]:.3f} '
+                f'(geo={vp["geo_uncertainty"]:.3f} '
+                f'ang={vp["score_angular"]:.3f})')
+
+    def _generate_nbv_analysis(self):
+        """Generate all NBV convergence plots and 3D visualization.
+
+        Called once after mission completes. Uses self.round_history.
+        """
+        if not self.round_history:
+            return
+
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        analysis_dir = os.path.join(self.nbv_dir, 'analysis')
+        os.makedirs(analysis_dir, exist_ok=True)
+
+        rounds = [r['round'] for r in self.round_history]
+        n_rounds = len(rounds)
+
+        # ── 1. Round summary CSV ──
+        csv_path = os.path.join(self.nbv_dir, 'round_summary.csv')
+        with open(csv_path, 'w') as f:
+            f.write('round,n_kfs,coverage_pct,n_gaussians,'
+                    'geo_uncertainty_mean,geo_uncertainty_max,'
+                    'bbox_uncov_mean,bbox_uncov_max,angular_dist_mean,'
+                    'score_max,score_min,score_mean,'
+                    'loss,psnr,ssim,compute_ms\n')
+            for r in self.round_history:
+                f.write(f'{r["round"]},{r["n_kfs_at_scoring"]},'
+                        f'{r["coverage_pct"]:.4f},{r["n_gaussians"]},'
+                        f'{r.get("geo_uncertainty_mean", 0):.4f},'
+                        f'{r.get("geo_uncertainty_max", 0):.4f},'
+                        f'{r.get("bbox_uncov_mean", 0):.4f},'
+                        f'{r.get("bbox_uncov_max", 0):.4f},'
+                        f'{r.get("angular_dist_mean", 0):.4f},'
+                        f'{r["score_max"]:.4f},{r["score_min"]:.4f},'
+                        f'{r["score_mean"]:.4f},'
+                        f'{r["training_loss"]:.6f},'
+                        f'{r["training_psnr"]:.2f},'
+                        f'{r["training_ssim"]:.4f},'
+                        f'{r["scoring_compute_ms"]:.1f}\n')
+        self.get_logger().info(f'Saved nbv/round_summary.csv')
+
+        # ── 2. NBV signal convergence (bbox-alpha + angular diversity) ──
+        fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+        ax1, ax2 = axes
+
+        geo_uncert = [r.get('geo_uncertainty_mean', 0) for r in self.round_history]
+        geo_uncert_max = [r.get('geo_uncertainty_max', 0) for r in self.round_history]
+        bbox_uncov = [r.get('bbox_uncov_mean', 0) for r in self.round_history]
+        angular_mean = [r.get('angular_dist_mean', 0) for r in self.round_history]
+        angular_min = [r.get('angular_dist_min', 0) for r in self.round_history]
+        score_mean = [r.get('score_mean', 0) for r in self.round_history]
+        n_kfs = [r['n_kfs_at_scoring'] for r in self.round_history]
+
+        ax1.plot(rounds, geo_uncert, 'r-o', label='Geo Uncert Mean', markersize=6)
+        ax1.plot(rounds, geo_uncert_max, 'r--^', label='Geo Uncert Max',
+                 markersize=5, alpha=0.6)
+        ax1.plot(rounds, bbox_uncov, '--', color='gray', label='Bbox Uncov Mean (old)',
+                 markersize=4, alpha=0.5)
+        ax1.set_ylabel('Uncertainty (0=certain, high=uncertain)')
+        ax1.set_title('NBV Signal Convergence (should decrease as model improves)')
+        ax1.legend(loc='upper left')
+        ax1.grid(True, alpha=0.3)
+        for i, (rd, kf) in enumerate(zip(rounds, n_kfs)):
+            ax1.annotate(f'{kf}kf', (rd, geo_uncert[i]),
+                         textcoords='offset points', xytext=(0, 10),
+                         fontsize=7, color='gray', ha='center')
+
+        ax2.plot(rounds, angular_mean, 'm-o', label='Angular Dist Mean', markersize=6)
+        ax2.plot(rounds, angular_min, 'm--s', label='Angular Dist Min',
+                 markersize=5, alpha=0.6)
+        ax2_twin = ax2.twinx()
+        ax2_twin.plot(rounds, score_mean, 'b-^', label='Combined Score Mean', markersize=6)
+        ax2_twin.set_ylabel('Combined Score', color='blue')
+        ax2.set_xlabel('Scoring Round')
+        ax2.set_ylabel('Angular Distance (0=redundant, 1=novel)')
+        ax2.set_title('Angular Diversity + Combined Score')
+        ax2.legend(loc='upper left')
+        ax2_twin.legend(loc='upper right')
+        ax2.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(analysis_dir, 'nbv_signal_convergence.png'),
+                    dpi=150)
+        plt.close()
+
+        # ── 3. Score distribution shift (box plot per round) ──
+        fig, ax = plt.subplots(figsize=(max(12, n_rounds * 1.5), 6))
+        score_data = []
+        labels = []
+        for r in self.round_history:
+            scores = [c['score'] for c in r['all_candidate_scores']]
+            if scores:
+                score_data.append(scores)
+                labels.append(f'R{r["round"]}\n({r["n_kfs_at_scoring"]}kf)')
+
+        if score_data:
+            bp = ax.boxplot(score_data, tick_labels=labels, patch_artist=True)
+            colors = plt.cm.viridis(np.linspace(0, 1, len(score_data)))
+            for patch, color in zip(bp['boxes'], colors):
+                patch.set_facecolor(color)
+                patch.set_alpha(0.6)
+            # Mark selected scores
+            for i, r in enumerate(self.round_history):
+                sel_scores = [s['score'] for s in r['selected']]
+                ax.scatter([i + 1] * len(sel_scores), sel_scores,
+                           color='red', zorder=5, s=50, marker='*',
+                           label='Selected' if i == 0 else None)
+            ax.set_xlabel('Scoring Round (KFs at time of scoring)')
+            ax.set_ylabel('Candidate Score')
+            ax.set_title('Score Distribution Shift Across Rounds '
+                         '(red stars = selected)')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(analysis_dir, 'score_distribution.png'),
+                    dpi=150)
+        plt.close()
+
+        # ── 4. Coverage + training metrics vs round ──
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+        coverage = [r['coverage_pct'] * 100 for r in self.round_history]
+        axes[0, 0].plot(rounds, coverage, 'g-o', markersize=6)
+        axes[0, 0].set_ylabel('Coverage %')
+        axes[0, 0].set_title('Voxel Coverage vs Round')
+        axes[0, 0].grid(True, alpha=0.3)
+
+        loss = [r['training_loss'] for r in self.round_history]
+        axes[0, 1].plot(rounds, loss, 'b-o', markersize=6)
+        axes[0, 1].set_ylabel('Training Loss')
+        axes[0, 1].set_title('Training Loss at Each Scoring')
+        axes[0, 1].grid(True, alpha=0.3)
+
+        psnr = [r['training_psnr'] for r in self.round_history]
+        axes[1, 0].plot(rounds, psnr, 'r-o', markersize=6)
+        axes[1, 0].set_xlabel('Scoring Round')
+        axes[1, 0].set_ylabel('PSNR (dB)')
+        axes[1, 0].set_title('Live PSNR at Each Scoring')
+        axes[1, 0].grid(True, alpha=0.3)
+
+        n_gs = [r['n_gaussians'] / 1000 for r in self.round_history]
+        axes[1, 1].plot(rounds, n_gs, 'purple', marker='o', markersize=6)
+        axes[1, 1].set_xlabel('Scoring Round')
+        axes[1, 1].set_ylabel('Gaussians (K)')
+        axes[1, 1].set_title('Gaussian Count at Each Scoring')
+        axes[1, 1].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(analysis_dir, 'training_convergence.png'),
+                    dpi=150)
+        plt.close()
+
+        # ── 5. Viewpoint selection polar plot (azimuth x elevation) ──
+        fig, ax = plt.subplots(figsize=(12, 8))
+        cmap = plt.cm.tab10
+        for r in self.round_history:
+            rd = r['round']
+            color = cmap(rd % 10)
+            for s in r['selected']:
+                ax.scatter(s['azimuth_deg'], s['elevation_deg'],
+                           c=[color], s=120, zorder=5,
+                           edgecolors='black', linewidths=0.5,
+                           label=f'Round {rd}' if s == r['selected'][0] else None)
+        # Plot seed positions
+        for i, meta in enumerate(self.frames_meta[:self.seed_kfs]):
+            pos = meta['position_ned']
+            dx = pos[0] - self.rock_ned[0]
+            dy = pos[1] - self.rock_ned[1]
+            dz = pos[2] - self.rock_ned[2]
+            horiz = math.sqrt(dx * dx + dy * dy)
+            el = math.degrees(math.atan2(-dz, horiz))
+            az = math.degrees(math.atan2(dy, dx))
+            if az < 0:
+                az += 360
+            ax.scatter(az, el, c='black', s=150, marker='D', zorder=6,
+                       label='Seed' if i == 0 else None)
+
+        # Plot all candidates as faint dots
+        if self.round_history and self.round_history[0]['all_candidate_scores']:
+            for c in self.round_history[0]['all_candidate_scores']:
+                ax.scatter(c['azimuth_deg'], c['elevation_deg'],
+                           c='lightgray', s=20, zorder=1, alpha=0.5)
+
+        ax.set_xlabel('Azimuth (degrees)')
+        ax.set_ylabel('Elevation (degrees)')
+        ax.set_title('Viewpoint Selection by Round '
+                     '(gray = candidates, black diamonds = seed)')
+        ax.set_xlim(0, 360)
+        ax.set_ylim(0, 90)
+        ax.legend(loc='upper right', fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(analysis_dir, 'viewpoint_selection_map.png'),
+                    dpi=150)
+        plt.close()
+
+        # ── 6. Scoring compute time per round ──
+        fig, ax = plt.subplots(figsize=(10, 4))
+        compute_ms = [r['scoring_compute_ms'] for r in self.round_history]
+        ax.bar(rounds, compute_ms, color='steelblue', alpha=0.8)
+        ax.set_xlabel('Scoring Round')
+        ax.set_ylabel('Compute Time (ms)')
+        ax.set_title('Scoring Compute Time per Round')
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(analysis_dir, 'scoring_compute.png'),
+                    dpi=150)
+        plt.close()
+
+        # ── 7. 3D interactive plot (Plotly HTML) ──
+        self._generate_3d_plotly(analysis_dir)
+
+        # Save full round history as single JSON
+        with open(os.path.join(self.nbv_dir, 'round_history.json'), 'w') as f:
+            json.dump(self.round_history, f, indent=2)
+
+        self.get_logger().info(
+            f'Saved NBV analysis: {n_rounds} rounds to nbv/analysis/')
+
+    def _generate_3d_plotly(self, output_dir):
+        """Generate interactive 3D Plotly visualization of viewpoints."""
+        try:
+            import plotly.graph_objects as go
+        except ImportError:
+            self.get_logger().warning(
+                'plotly not installed, skipping 3D visualization. '
+                'Install with: pip install plotly')
+            return
+
+        fig = go.Figure()
+
+        rock = self.rock_ned
+        half = self.bbox_size / 2.0
+
+        # Bounding box wireframe
+        corners = np.array([
+            [rock[0] - half, rock[1] - half, rock[2] - half],
+            [rock[0] + half, rock[1] - half, rock[2] - half],
+            [rock[0] + half, rock[1] + half, rock[2] - half],
+            [rock[0] - half, rock[1] + half, rock[2] - half],
+            [rock[0] - half, rock[1] - half, rock[2] + half],
+            [rock[0] + half, rock[1] - half, rock[2] + half],
+            [rock[0] + half, rock[1] + half, rock[2] + half],
+            [rock[0] - half, rock[1] + half, rock[2] + half],
+        ])
+        edges = [
+            (0, 1), (1, 2), (2, 3), (3, 0),  # bottom
+            (4, 5), (5, 6), (6, 7), (7, 4),  # top
+            (0, 4), (1, 5), (2, 6), (3, 7),  # verticals
+        ]
+        for i, j in edges:
+            fig.add_trace(go.Scatter3d(
+                x=[corners[i, 0], corners[j, 0]],
+                y=[corners[i, 1], corners[j, 1]],
+                z=[-corners[i, 2], -corners[j, 2]],  # flip z for display
+                mode='lines',
+                line=dict(color='gray', width=2),
+                showlegend=False,
+                hoverinfo='skip',
+            ))
+
+        # Rock center
+        fig.add_trace(go.Scatter3d(
+            x=[rock[0]], y=[rock[1]], z=[-rock[2]],
+            mode='markers',
+            marker=dict(size=8, color='black', symbol='diamond'),
+            name='Rock center',
+            hovertext='Rock center',
+        ))
+
+        # Seed viewpoints
+        seed_positions = []
+        for meta in self.frames_meta[:self.seed_kfs]:
+            p = meta['position_ned']
+            seed_positions.append(p)
+        if seed_positions:
+            sp = np.array(seed_positions)
+            fig.add_trace(go.Scatter3d(
+                x=sp[:, 0], y=sp[:, 1], z=-sp[:, 2],
+                mode='markers',
+                marker=dict(size=7, color='black', symbol='diamond'),
+                name='Seed',
+                hovertext=[f'Seed KF {i}' for i in range(len(sp))],
+            ))
+            # Lines from seed to rock
+            for p in seed_positions:
+                fig.add_trace(go.Scatter3d(
+                    x=[p[0], rock[0]], y=[p[1], rock[1]],
+                    z=[-p[2], -rock[2]],
+                    mode='lines',
+                    line=dict(color='black', width=1),
+                    showlegend=False, hoverinfo='skip',
+                ))
+
+        # Round viewpoints (colored by round)
+        colors = [
+            '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728',
+            '#9467bd', '#8c564b', '#e377c2', '#7f7f7f',
+            '#bcbd22', '#17becf', '#aec7e8', '#ffbb78',
+        ]
+        for r in self.round_history:
+            rd = r['round']
+            color = colors[rd % len(colors)]
+            positions = np.array([s['position'] for s in r['selected']])
+            hover = [
+                f'Round {rd}, KF {r["n_kfs_at_scoring"]+i}<br>'
+                f'Az={s["azimuth_deg"]:.0f}° El={s["elevation_deg"]:.0f}°<br>'
+                f'Score={s["score"]:.3f} (geo={s.get("geo_uncertainty", 0):.3f}, ang={s.get("score_angular", 0):.3f})<br>'
+                f'BboxArea={s.get("bbox_area_frac", 0):.2f}'
+                for i, s in enumerate(r['selected'])
+            ]
+            fig.add_trace(go.Scatter3d(
+                x=positions[:, 0], y=positions[:, 1], z=-positions[:, 2],
+                mode='markers',
+                marker=dict(size=6, color=color),
+                name=f'Round {rd} ({r["n_kfs_at_scoring"]}kf)',
+                hovertext=hover,
+            ))
+            # Lines to rock center
+            for p in positions:
+                fig.add_trace(go.Scatter3d(
+                    x=[p[0], rock[0]], y=[p[1], rock[1]],
+                    z=[-p[2], -rock[2]],
+                    mode='lines',
+                    line=dict(color=color, width=1),
+                    opacity=0.3,
+                    showlegend=False, hoverinfo='skip',
+                ))
+
+        # All candidates as faint dots
+        if (self.round_history
+                and self.round_history[0]['all_candidate_scores']):
+            # Get positions from the planner candidates
+            cand_positions = np.array([
+                c['position'] for c in self.planner.candidates],
+                dtype=np.float32)
+            fig.add_trace(go.Scatter3d(
+                x=cand_positions[:, 0],
+                y=cand_positions[:, 1],
+                z=-cand_positions[:, 2],
+                mode='markers',
+                marker=dict(size=2, color='lightgray', opacity=0.3),
+                name='All candidates',
+                hoverinfo='skip',
+            ))
+
+        fig.update_layout(
+            title=f'NBV Viewpoint Selection — {self.kf_count} KFs, '
+                  f'{len(self.round_history)} rounds',
+            scene=dict(
+                xaxis_title='X (NED North)',
+                yaxis_title='Y (NED East)',
+                zaxis_title='Altitude (m, up)',
+                aspectmode='data',
+            ),
+            width=1200, height=800,
+            legend=dict(x=0.02, y=0.98),
+        )
+
+        html_path = os.path.join(output_dir, 'viewpoints_3d.html')
+        fig.write_html(html_path)
+        self.get_logger().info(f'Saved 3D viewpoint plot: {html_path}')
 
     # ── Flight state machine (main loop) ───────────────────
 
     def _loop(self):
-        # DONE: stop publishing offboard, do nothing
+        # DONE: fully stopped. FINISHING: waiting for optimizer, no offboard needed.
         if self.phase == 'DONE':
+            return
+        if self.phase == 'FINISHING':
+            # Still check if optimizer finished, but don't publish offboard
+            if not self.opt_thread.is_alive():
+                self._save_all()
+                self._enter_phase('DONE')
+                self.get_logger().info('Data saved. Done.')
             return
 
         self._pub_offboard()
         if self.pos is None or self.status is None:
             return
 
+        # Gimbal — publish every tick like mapping package (proven stable).
         self._pub_gimbal(self.gimbal_pitch_rad)
 
         # ── PREFLIGHT ──
         if self.phase == 'PREFLIGHT':
+            # On first tick with valid heading, calibrate NED frame offset.
+            # Drone spawns facing Gazebo +X = East → true NED heading = π/2.
+            # Any difference means PX4's NED is rotated from the Gazebo world.
+            # Rotate rock_ned into PX4's frame so all navigation is consistent.
+            if not self._ned_calibrated and self.counter >= 20:
+                expected = math.pi / 2.0
+                offset = self.pos.heading - expected
+                self.get_logger().info(
+                    f'NED heading offset {math.degrees(offset):.1f}° '
+                    f'(not rotating — gimbal handles centering)')
+                self._ned_calibrated = True
+
             yaw = math.atan2(self.rock_y, self.rock_x)
-            self._pub_setpoint(0.0, 0.0, self.alt_ned, yaw)
+            takeoff_alt = -1.5
+            self._pub_setpoint(0.0, 0.0, takeoff_alt, yaw, max_speed=None)
             self.counter += 1
             if self.counter >= 40:
                 self._offboard()
                 self._arm()
                 self.mission_start_time = self._now_sec()
                 self._enter_phase('TAKEOFF')
-                self.get_logger().info(
-                    f'TAKEOFF to {abs(self.alt_ned):.1f}m')
+                self.get_logger().info('TAKEOFF to 1.5m')
 
         # ── TAKEOFF ──
         elif self.phase == 'TAKEOFF':
             yaw = math.atan2(self.rock_y, self.rock_x)
-            self._pub_setpoint(0.0, 0.0, self.alt_ned, yaw)
-            if self._dist_to(0.0, 0.0, self.alt_ned) < 0.5:
-                self._enter_phase('INITIAL_ORBIT')
+            takeoff_alt = -1.5
+            self._pub_setpoint(0.0, 0.0, takeoff_alt, yaw, max_speed=None)
+            if self._dist_to(0.0, 0.0, takeoff_alt) < 0.5:
+                # Build seed waypoints: seed_kfs points spread evenly
+                self._setup_pass(0)
+                self.waypoints = []
+                for i in range(self.seed_kfs):
+                    angle = 2.0 * math.pi * i / self.seed_kfs
+                    x = self.rock_x + self.radius * math.cos(angle)
+                    y = self.rock_y + self.radius * math.sin(angle)
+                    z = self.alt_ned
+                    yw = math.atan2(self.rock_y - y, self.rock_x - x)
+                    self.waypoints.append((x, y, z, yw))
+                self.n_wp = self.seed_kfs
+                self.wp_idx = 0
+                # Fly to first seed waypoint at full speed (no speed limit)
+                self._enter_phase('FLY_TO_START')
                 self.get_logger().info(
-                    f'INITIAL_ORBIT: alt={abs(self.alt_ned):.1f}m '
-                    f'gimbal={math.degrees(self.gimbal_pitch_rad):.0f}deg')
+                    f'Flying to first seed waypoint at '
+                    f'({self.waypoints[0][0]:.1f}, '
+                    f'{self.waypoints[0][1]:.1f})')
 
-        # ── INITIAL_ORBIT ──
-        elif self.phase == 'INITIAL_ORBIT':
-            self._run_orbit('SECOND_ORBIT')
-
-        # ── CLIMB (between orbits) ──
-        elif self.phase == 'CLIMB':
+        # ── FLY_TO_START: get to first seed waypoint fast ──
+        elif self.phase == 'FLY_TO_START':
             x, y, z, yaw = self.waypoints[0]
-            self._pub_setpoint(self.pos.x, self.pos.y, self.alt_ned, yaw)
-            if abs(self.pos.z - self.alt_ned) < 0.5:
-                self._enter_phase('SECOND_ORBIT')
+            self._pub_setpoint(x, y, z, yaw, max_speed=8.0)
+            if self._dist_to(x, y, z) < 0.5:
+                self._enter_phase('SEED')
                 self.get_logger().info(
-                    f'SECOND_ORBIT: alt={abs(self.alt_ned):.1f}m '
-                    f'gimbal={math.degrees(self.gimbal_pitch_rad):.0f}deg')
+                    f'SEED: {self.seed_kfs} viewpoints at '
+                    f'alt={self.orbit_alt}m, radius={self.radius}m')
 
-        # ── SECOND_ORBIT ──
-        elif self.phase == 'SECOND_ORBIT':
-            self._run_orbit('RETURN')
+        # ── SEED: capture initial views to bootstrap 3DGS ──
+        elif self.phase == 'SEED':
+            if self.wp_idx >= len(self.waypoints):
+                if self.skip_adaptive:
+                    self.get_logger().info(
+                        f'Seed complete ({self.kf_count} KFs), '
+                        f'skip_adaptive=True — returning to land')
+                    self._enter_phase('RETURN')
+                    return
+                self.get_logger().info(
+                    f'Seed complete ({self.kf_count} KFs), '
+                    f'waiting for training before first scoring...')
+                self._enter_phase('NBV_WAIT')
+                return
+
+            x, y, z, yaw = self.waypoints[self.wp_idx]
+            # Fixed setpoint — PX4 handles approach.
+            self._pub_setpoint(x, y, z, yaw)
+
+            if self._dist_to(x, y, z) < 0.5:
+                yaw_ok = self._yaw_error_to_rock() < math.radians(5)
+                if not yaw_ok:
+                    self.settle_start = None
+                    self._gimbal_set = False
+                elif not getattr(self, '_gimbal_set', False):
+                    # Arrived & facing rock — compute exact pitch ONCE
+                    self._set_gimbal_to_rock()
+                    self._gimbal_set = True
+                    self.settle_start = self._sim_sec()
+                elif (self._sim_sec() - self.settle_start) >= self.settle_time:
+                    self._capture_keyframe(yaw)
+                    self.settle_start = None
+                    self._gimbal_set = False
+                    self.wp_idx += 1
+                    self.get_logger().info(
+                        f'Seed {self.wp_idx}/{len(self.waypoints)}')
+
+        # ── NBV_WAIT: wait for optimizer to process before scoring ──
+        elif self.phase == 'NBV_WAIT':
+            # Hold position at last waypoint or last NBV target
+            if self.nbv_target is not None:
+                t = self.nbv_target
+                self._pub_setpoint(
+                    float(t['position'][0]), float(t['position'][1]),
+                    float(t['position'][2]), float(t['yaw']))
+            elif self.waypoints:
+                x, y, z, yaw = self.waypoints[-1]
+                self._pub_setpoint(x, y, z, yaw)
+
+            # Wait for optimizer to have processed all queued KFs
+            if (self.kf_queue.empty() and len(self.training_log) > 0):
+                self._run_nbv_scoring()
+
+                if self.nbv_queue:
+                    self.nbv_target = self.nbv_queue.pop(0)
+                    self.gimbal_pitch_rad = self._pitch_for_elevation(
+                        self.nbv_target['elevation_deg'])
+                    self.avoid_waypoint = self._path_needs_avoidance(
+                        self.nbv_target['position'])
+                    self.avoid_waypoint_transit = None
+                    self.avoid_approach = None
+                    self._enter_phase('NBV_FLY')
+                    self.get_logger().info(
+                        f'NBV round {self.nbv_round}: {len(self.nbv_queue)+1} '
+                        f'viewpoints, first: '
+                        f'az={self.nbv_target["azimuth_deg"]:.0f}° '
+                        f'el={self.nbv_target["elevation_deg"]:.0f}°')
+                else:
+                    self.get_logger().info('No NBV candidates, returning')
+                    self._enter_phase('RETURN')
+
+        # ── NBV_FLY: fly to current NBV target ──
+        # 4-phase path to avoid rock collisions:
+        #   Phase 1: Climb at current XY to safe altitude
+        #   Phase 2: Transit at safe altitude to target XY (or cylinder edge)
+        #   Phase 3: If target is above rock, descend at cylinder edge,
+        #            then fly inward to target at target altitude
+        #   Phase 4: Final approach to target position
+        elif self.phase == 'NBV_FLY':
+            if self.nbv_target is None:
+                self._enter_phase('RETURN')
+                return
+
+            # Phase 1: Climb at current XY to safe altitude
+            if self.avoid_waypoint is not None:
+                ax, ay, az_wp, a_yaw = self.avoid_waypoint
+                self._pub_setpoint(ax, ay, az_wp, a_yaw)
+                if self._dist_to(ax, ay, az_wp) < 0.8:
+                    t = self.nbv_target
+                    tx, ty, tz = t['position']
+                    # Check if target is above rock — transit to cylinder
+                    # edge at safe alt, not directly to target XY
+                    above = self._target_above_rock(t['position'])
+                    if above is not None:
+                        # Transit to cylinder edge at safe alt
+                        self.avoid_waypoint_transit = (
+                            above[0], above[1], az_wp, float(t['yaw']))
+                        self.avoid_approach = above  # descend here, then fly in
+                    else:
+                        # Target is clear — transit directly to target XY
+                        self.avoid_waypoint_transit = (
+                            float(tx), float(ty), az_wp, float(t['yaw']))
+                        self.avoid_approach = None
+                    self.avoid_waypoint = None
+                return
+
+            # Phase 2: Fly at safe altitude to target XY (or cylinder edge)
+            if self.avoid_waypoint_transit is not None:
+                tx, ty, tz_safe, t_yaw = self.avoid_waypoint_transit
+                self._pub_setpoint(tx, ty, tz_safe, t_yaw)
+                if self._dist_to(tx, ty, tz_safe) < 0.8:
+                    self.avoid_waypoint_transit = None
+                return
+
+            # Phase 3: If approaching from cylinder edge, descend at edge
+            # then fly inward to target at target altitude
+            if hasattr(self, 'avoid_approach') and \
+                    self.avoid_approach is not None:
+                ax, ay, az_app, a_yaw = self.avoid_approach
+                self._pub_setpoint(ax, ay, az_app, a_yaw)
+                if self._dist_to(ax, ay, az_app) < 0.5:
+                    self.avoid_approach = None  # now fly to actual target
+                return
+
+            # Phase 4: Final approach to target position
+            t = self.nbv_target
+            x, y, z = t['position']
+            yaw = t['yaw']
+            self._pub_setpoint(
+                float(x), float(y), float(z), float(yaw))
+
+            if self._dist_to(float(x), float(y), float(z)) < 0.5:
+                self.settle_start = self._sim_sec()
+                self._enter_phase('NBV_SETTLE')
+
+        # ── NBV_SETTLE: wait, capture, next target or re-score ──
+        elif self.phase == 'NBV_SETTLE':
+            if self.nbv_target is None:
+                self._enter_phase('RETURN')
+                return
+
+            t = self.nbv_target
+            x, y, z = t['position']
+            # Fixed setpoint — no per-tick recomputation
+            self._pub_setpoint(
+                float(x), float(y), float(z), float(t['yaw']))
+
+            yaw_ok = self._yaw_error_to_rock() < math.radians(5)
+            if not yaw_ok:
+                self.settle_start = self._sim_sec()
+                self._gimbal_set = False
+            elif not getattr(self, '_gimbal_set', False):
+                # Arrived & facing rock — compute exact pitch ONCE
+                self._set_gimbal_to_rock()
+                self._gimbal_set = True
+                self.settle_start = self._sim_sec()
+
+            # Wait for gimbal to converge after pitch was set
+            nbv_settle = max(self.settle_time, 1.5)
+            if (yaw_ok and self._gimbal_set and
+                    (self._sim_sec() - self.settle_start) >= nbv_settle):
+                self._capture_keyframe(float(t['yaw']))
+                self.planner.mark_visited(t['position'])
+                self.nbv_batch_count += 1
+
+                self.get_logger().info(
+                    f'NBV KF {self.kf_count}: '
+                    f'az={t["azimuth_deg"]:.0f}° '
+                    f'el={t["elevation_deg"]:.0f}° '
+                    f'score={t.get("score", 0):.1f} '
+                    f'(batch {self.nbv_batch_count}/{self.batch_size}, '
+                    f'round {self.nbv_round})')
+
+                # Budget exhausted?
+                if self.kf_count >= self.kf_budget:
+                    self.get_logger().info(
+                        f'Budget reached ({self.kf_count} total KFs)')
+                    self._enter_phase('RETURN')
+                # Batch complete? Re-score with updated model
+                elif self.nbv_batch_count >= self.batch_size:
+                    self.get_logger().info(
+                        f'Batch complete ({self.nbv_batch_count} KFs), '
+                        f're-scoring with {self.kf_count}-image model...')
+                    self._enter_phase('NBV_WAIT')
+                # More in current batch
+                elif self.nbv_queue:
+                    self.nbv_target = self.nbv_queue.pop(0)
+                    self.gimbal_pitch_rad = self._pitch_for_elevation(
+                        self.nbv_target['elevation_deg'])
+                    self.avoid_waypoint = self._path_needs_avoidance(
+                        self.nbv_target['position'])
+                    self.avoid_waypoint_transit = None
+                    self.avoid_approach = None
+                    self._enter_phase('NBV_FLY')
+                else:
+                    # Batch queue empty but count not reached — re-score
+                    self.get_logger().info('Batch queue empty, re-scoring...')
+                    self._enter_phase('NBV_WAIT')
 
         # ── RETURN ──
         elif self.phase == 'RETURN':
-            self._pub_setpoint(0.0, 0.0, -1.0, 0.0)
+            # Fly back to origin at safe altitude before landing
+            self._pub_setpoint(0.0, 0.0, -1.0, 0.0, max_speed=None)
             if self._dist_to(0.0, 0.0, -1.0) < 1.0:
                 self._land()
                 self._enter_phase('LANDING')
@@ -1770,40 +3163,12 @@ class ActiveMapperNode(Node):
         elif self.phase == 'LANDING':
             if self.pos.z > -0.3:
                 self._disarm()
-                self._save_all()
-                self._enter_phase('DONE')
+                # Signal optimizer to finish current round then stop
+                self._enter_phase('FINISHING')
                 self.get_logger().info(
-                    'Landed. Data + evaluation saved.')
+                    'Landed. Waiting for optimizer to finish current round...')
 
-    def _run_orbit(self, next_phase):
-        x, y, z, yaw = self.waypoints[self.wp_idx]
-        self._pub_setpoint(x, y, z, yaw)
-
-        at_wp = self._dist_to(x, y, z) < 0.5
-        if at_wp and self.settle_start is None:
-            self.settle_start = self._now_sec()
-
-        if at_wp and self.settle_start and (
-                self._now_sec() - self.settle_start) >= self.settle_time:
-            self._capture_keyframe(yaw)
-
-            self.wp_idx += 1
-            self.settle_start = None
-
-            if self.wp_idx >= len(self.waypoints):
-                self.current_pass += 1
-                if self.current_pass < len(self.passes):
-                    self._setup_pass(self.current_pass)
-                    self._enter_phase('CLIMB')
-                    self.get_logger().info('Orbit complete, climbing')
-                else:
-                    self._enter_phase(next_phase)
-                    self.get_logger().info(
-                        f'All orbits complete -> {next_phase}')
-            else:
-                self.get_logger().info(
-                    f'WP {self.wp_idx}/{len(self.waypoints)} '
-                    f'pass={self.current_pass}')
+        # ── FINISHING: handled at top of _loop ──
 
 
 def main():

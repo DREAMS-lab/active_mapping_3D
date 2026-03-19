@@ -1,5 +1,6 @@
-_ORBSLAM3_ROOT="$HOME/workspaces/zed_ws/ORB_SLAM3"
-_PANGOLIN_ROOT="$HOME/workspaces/zed_ws/Pangolin"
+# Override with ORBSLAM3_ROOT and PANGOLIN_ROOT env vars if set
+_ORBSLAM3_ROOT="${ORBSLAM3_ROOT:-$HOME/ORB_SLAM3}"
+_PANGOLIN_ROOT="${PANGOLIN_ROOT:-$HOME/Pangolin}"
 
 _ORBSLAM3_PATHS="$_ORBSLAM3_ROOT/lib:$_ORBSLAM3_ROOT/Thirdparty/DBoW2/lib:$_ORBSLAM3_ROOT/Thirdparty/g2o/lib:$_PANGOLIN_ROOT/build/src"
 

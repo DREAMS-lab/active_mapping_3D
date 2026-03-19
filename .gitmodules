@@ -1,6 +1,6 @@
-[submodule "orbslam3"]
-	path = orbslam3
-	url = https://github.com/zang09/ORB_SLAM3_ROS2.git
-[submodule "gaussian-splatting"]
-	path = gaussian-splatting
+[submodule "repos/gaussian-splatting"]
+	path = repos/gaussian-splatting
 	url = https://github.com/graphdeco-inria/gaussian-splatting.git
+[submodule "repos/orbslam3"]
+	path = repos/orbslam3
+	url = https://github.com/zang09/ORB_SLAM3_ROS2.git

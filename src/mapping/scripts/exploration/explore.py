@@ -76,7 +76,10 @@ class Explorer(Node):
         # Output directory
         base = self.get_parameter('data_dir').value
         if not base:
-            base = os.path.expanduser('~/workspaces/gs_ws/data/mapping')
+            # Default: <ws>/data/mapping (derive workspace root from install path)
+            ws_root = os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
+            base = os.path.join(ws_root, 'data', 'mapping')
         os.makedirs(base, exist_ok=True)
         run_num = 1
         while os.path.exists(os.path.join(base, f'run_{run_num:03d}')):
